@@ -2,9 +2,11 @@ name: Sync Upstream Snapshot
 
 on:
   schedule:
-    # 每天 UTC 20:00 (北京时间 04:00) 自动检查同步
     - cron: '0 20 * * *'
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/sync-upstream.yml'
 
 permissions:
   contents: write
