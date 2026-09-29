@@ -1,0 +1,182 @@
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index e8f3ffd..4d4e057 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -1089,6 +1089,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 	case upstream.ErrImageInvalid:
+ 		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
+ 		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
++	case upstream.ErrReasoningMissing:
++		// 11155 reasoning_content_missing（思考模式未回传上轮推理）：请求级错误，
++		// 严格租户一律 400、宽松租户可放过——与账号健康无关，绝不能喂连败
++		// （否则 3 个 global 号被 NoteFailures 逐个判死 → 池空 503 no_healthy_account）。
++		// 零惩罚（不冷却/不熔断/不 NoteError），但**仍然轮转**：换到宽松租户仍可能成功。
++		// 网关侧 backfillReasoningContent 已尽力补齐 reasoning_content 非空，此处是兜底。
+ 	case upstream.ErrBadParams:
+ 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
+ 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
+diff --git a/internal/upstream/backfill_test.go b/internal/upstream/backfill_test.go
+index 27683c0..4c0df31 100644
+--- a/internal/upstream/backfill_test.go
++++ b/internal/upstream/backfill_test.go
+@@ -201,9 +201,13 @@ func TestBackfillComposesWithInjectThinking(t *testing.T) {
+ 
+ // TestBackfillZeroTraceThinkingEnabled issue #165 复现锚（R1）：零痕迹多轮 deepseek，
+ // 经 L1 injectThinking 注入 enabled 后，thinkingEnabled 半边亮 → 每条 assistant
+-// 保证 reasoning_content 是 string（此处无 reasoning 可复制，全补空串）。
++// 保证 reasoning_content 是**非空** string（此处无 reasoning 可复制，补空白占位 " "）。
+ // 官方 ReasoningContentBackfillRule 的门控是 thinkingEnabled || hasTrace，
+ // 第三方客户端丢推理回传（零痕迹）形态下官方仍补，网关此前只移植了 hasTrace 半边。
++//
++// 11155 加固：上游兜底见到 reasoning_content 字段已存在即跳过，空串会原样落到严格
++// 租户的 len(reasoning_content)>0 校验上 → 400 code=11155 reasoning_content_missing。
++// 故此处补的必须是空白串而非空串（与 #165 对 reasoning 字段已实测的「空白串 200」同口径）。
+ func TestBackfillZeroTraceThinkingEnabled(t *testing.T) {
+ 	body := `{"model":"deepseek-v4-flash","messages":[
+ 		{"role":"user","content":"u1"},
+@@ -221,25 +225,25 @@ func TestBackfillZeroTraceThinkingEnabled(t *testing.T) {
+ 		t.Fatalf("assistant 消息数 = %d want 2 (out=%s)", len(got), out)
+ 	}
+ 	for i, rc := range got {
+-		if rc != "" { // 既有 string（含空串）即满足；<absent>（键不存在）不满足
+-			t.Errorf("零痕迹 enabled 形态下 assistant[%d].reasoning_content = %q want 存在且为 \"\" (out=%s)", i, rc, out)
++		if rc != " " { // 缺失/空串不满足 len>0 校验；非空空白占位才过闸
++			t.Errorf("零痕迹 enabled 形态下 assistant[%d].reasoning_content = %q want \" \" (out=%s)", i, rc, out)
+ 		}
+ 	}
+ }
+ 
+ // TestBackfillNullAndNonStringNormalized issue #165 null/非 string 归一化（R3）：
+ // 官方跳过条件是 "string"!=typeof reasoning_content 才动手——null/数字会被旧代码
+-// 的 if _, ok（键存在即跳过）当「已有」跳过，新契约归一化为 ""。
++// 的 if _, ok（键存在即跳过）当「已有」跳过，新契约归一化为非空空白占位 " "。
+ // 注意 hasTrace 半边：reasoning_content 键存在本身即痕迹，门控必然亮。
+ func TestBackfillNullAndNonStringNormalized(t *testing.T) {
+ 	cases := []struct {
+ 		name string
+ 		body string
+ 	}{
+-		{"reasoning_content:null 归一化为空串",
++		{"reasoning_content:null 归一化为空白占位",
+ 			`{"model":"deepseek-v4-flash","messages":[
+ 				{"role":"assistant","content":"a","reasoning_content":null}]}`},
+-		{"reasoning_content:数字 归一化为空串",
++		{"reasoning_content:数字 归一化为空白占位",
+ 			`{"model":"deepseek-v4-flash","messages":[
+ 				{"role":"assistant","content":"a","reasoning_content":123}]}`},
+ 	}
+@@ -250,8 +254,8 @@ func TestBackfillNullAndNonStringNormalized(t *testing.T) {
+ 			if len(got) != 1 {
+ 				t.Fatalf("assistant 消息数 = %d want 1 (out=%s)", len(got), out)
+ 			}
+-			if got[0] != "" || got[0] == "<absent>" {
+-				t.Errorf("reasoning_content 应归一化为 \"\", got %q (out=%s)", got[0], out)
++			if got[0] != " " || got[0] == "<absent>" {
++				t.Errorf("reasoning_content 应归一化为 \" \", got %q (out=%s)", got[0], out)
+ 			}
+ 		})
+ 	}
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index 13d6f68..6cb3167 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -37,6 +37,7 @@ const (
+ 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
+ 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
+ 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
++	ErrReasoningMissing              // 11155 reasoning_content_missing（思考模式未回传上轮推理）→ 请求级错误：不罚号（不冷却/不熔断/不 NoteError），仍轮转（严格租户拒、宽松租户可过）
+ 	ErrClient                        // 其他 4xx / 业务错误
+ )
+ 
+@@ -66,6 +67,8 @@ func (k ErrKind) String() string {
+ 		return "prompt_too_long"
+ 	case ErrImageInvalid:
+ 		return "image_invalid"
++	case ErrReasoningMissing:
++		return "reasoning_content_missing"
+ 	case ErrClient:
+ 		return "client"
+ 	default:
+@@ -246,6 +249,24 @@ func isPromptTooLongStatus(status int) bool {
+ 		status == http.StatusRequestEntityTooLarge
+ }
+ 
++// reasoningMissingRule 11155「reasoning_content_missing」判定。
++// 定位：思考模式下客户端未把上一轮推理原样带回（上游 extError.code =
++// reasoning_content_missing，HTTP 400，type=invalid_request_error）。这是**请求的
++// 问题不是账号的问题**——同一 body 换号在严格租户一律 400、宽松租户可放过，与账号
++// 健康度无关。若不单独分类会落 ErrClient → handler 调 NoteFailures 累计连败 →
++// 三个 global 号全被判死 → 池空 503 no_healthy_account（本仓实测的雪崩形态）。
++// marker 双通道：
++//   - `"code":11155` / `"code":"11155"`：业务信封 code（JSON 空格容差）；
++//   - "reasoning_content_missing" / 文案：extError 兜底（大小写不敏感）。
++//
++// 只在 400 上判（该错误固定 400；429/5xx 属限流/服务端故障优先）。
++var reasoningMissingRule = errorRule{kind: ErrReasoningMissing, mode: matchFold, patterns: []string{
++	`"code":11155`,
++	`"code":"11155"`,
++	"reasoning_content_missing",
++	"reasoning content from the previous turn must be passed back",
++}}
++
+ // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
+ // 与容器时区无关）。
+ var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
+@@ -584,6 +605,12 @@ func Classify(status int, body string) ErrKind {
+ 	if isPromptTooLongStatus(status) && promptTooLongRule.hit(body, lower) {
+ 		return ErrPromptTooLong
+ 	}
++	// 11155「reasoning_content_missing」：思考模式未回传上轮推理 —— 请求级语义，
++	// 判在通用 4xx 兜底之前（否则落 ErrClient → NoteFailures 连败 → 团灭 global 池）。
++	// 只认 400（见 reasoningMissingRule）。
++	if status == http.StatusBadRequest && reasoningMissingRule.hit(body, lower) {
++		return ErrReasoningMissing
++	}
+ 	if status == http.StatusNotFound {
+ 		return ErrNotFound
+ 	}
+diff --git a/internal/upstream/thinking.go b/internal/upstream/thinking.go
+index 3d15494..e6d7a05 100644
+--- a/internal/upstream/thinking.go
++++ b/internal/upstream/thinking.go
+@@ -121,25 +121,26 @@ func backfillReasoningContent(obj map[string]any) {
+ 		if role != "assistant" {
+ 			continue
+ 		}
++		// rc 来源：已有非空 reasoning_content 优先；否则复制非空 reasoning；否则空。
+ 		rc, hasRC := msg["reasoning_content"].(string)
+-		if hasRC {
+-			// rc 已有 string → 不覆盖（原有语义保留）。
+-		} else if r, ok := msg["reasoning"].(string); ok {
+-			rc = r
+-			msg["reasoning_content"] = rc
+-		} else {
+-			rc = ""
+-			msg["reasoning_content"] = rc
++		if !hasRC || rc == "" {
++			if r, ok := msg["reasoning"].(string); ok && r != "" {
++				rc = r
++			}
+ 		}
+-		// 镜像：reasoning 缺失/null/空串 → 归一化（非空 rc 优先，皆无补 " "）。
++		// 关键（11155 reasoning_content_missing）：reasoning_content 缺失/空串时补
++		// 空白占位。上游兜底见到 reasoning_content 字段已存在即跳过，空串会原样落到
++		// 严格租户的 len(reasoning_content)>0 校验上 → HTTP 400 code=11155；空白串
++		// 过闸（与 #165 对 reasoning 字段已实测的「空白串 200」同口径）。
++		if rc == "" {
++			rc = " "
++		}
++		msg["reasoning_content"] = rc
++		// 镜像：reasoning 缺失/null/空串 → 归一化（两字段最终都存在且非空）。
+ 		if r, ok := msg["reasoning"].(string); ok && r != "" {
+ 			continue // 已非空 → 不覆盖
+ 		}
+-		if rc != "" {
+-			msg["reasoning"] = rc
+-		} else {
+-			msg["reasoning"] = " "
+-		}
++		msg["reasoning"] = rc
+ 	}
+ }
+ 
