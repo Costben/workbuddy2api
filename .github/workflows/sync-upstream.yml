@@ -1,0 +1,49 @@
+name: Sync Upstream Snapshot
+
+on:
+  schedule:
+    # 每天 UTC 20:00 (北京时间 04:00) 自动检查同步
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run sync and patch script
+        id: sync_run
+        run: |
+          chmod +x ./sync.sh
+          ./sync.sh
+
+      - name: Commit and push if changed
+        if: success()
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .
+            git commit -m "chore(sync): auto-sync ithtelab upstream-src snapshot and re-apply patches"
+            git push origin master
+            echo "✅ 成功同步并推送到远程 master 分支"
+          else
+            echo "无需更新：工作区无变更"
+          fi
+
+      - name: Create Issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "🚨 [Auto-Sync] 上游快照同步或补丁应用失败" \
+            --body "检测到 ithtelab/workbuddy-manager 的 upstream-src 快照有更新，但在应用 patches/ 下的本地补丁时发生冲突或错误。详情请查看此 Actions 运行日志。"

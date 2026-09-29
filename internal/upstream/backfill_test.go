@@ -201,9 +201,13 @@ func TestBackfillComposesWithInjectThinking(t *testing.T) {
 
 // TestBackfillZeroTraceThinkingEnabled issue #165 复现锚（R1）：零痕迹多轮 deepseek，
 // 经 L1 injectThinking 注入 enabled 后，thinkingEnabled 半边亮 → 每条 assistant
-// 保证 reasoning_content 是 string（此处无 reasoning 可复制，全补空串）。
+// 保证 reasoning_content 是**非空** string（此处无 reasoning 可复制，补空白占位 " "）。
 // 官方 ReasoningContentBackfillRule 的门控是 thinkingEnabled || hasTrace，
 // 第三方客户端丢推理回传（零痕迹）形态下官方仍补，网关此前只移植了 hasTrace 半边。
+//
+// 11155 加固：上游兜底见到 reasoning_content 字段已存在即跳过，空串会原样落到严格
+// 租户的 len(reasoning_content)>0 校验上 → 400 code=11155 reasoning_content_missing。
+// 故此处补的必须是空白串而非空串（与 #165 对 reasoning 字段已实测的「空白串 200」同口径）。
 func TestBackfillZeroTraceThinkingEnabled(t *testing.T) {
 	body := `{"model":"deepseek-v4-flash","messages":[
 		{"role":"user","content":"u1"},
@@ -221,25 +225,25 @@ func TestBackfillZeroTraceThinkingEnabled(t *testing.T) {
 		t.Fatalf("assistant 消息数 = %d want 2 (out=%s)", len(got), out)
 	}
 	for i, rc := range got {
-		if rc != "" { // 既有 string（含空串）即满足；<absent>（键不存在）不满足
-			t.Errorf("零痕迹 enabled 形态下 assistant[%d].reasoning_content = %q want 存在且为 \"\" (out=%s)", i, rc, out)
+		if rc != " " { // 缺失/空串不满足 len>0 校验；非空空白占位才过闸
+			t.Errorf("零痕迹 enabled 形态下 assistant[%d].reasoning_content = %q want \" \" (out=%s)", i, rc, out)
 		}
 	}
 }
 
 // TestBackfillNullAndNonStringNormalized issue #165 null/非 string 归一化（R3）：
 // 官方跳过条件是 "string"!=typeof reasoning_content 才动手——null/数字会被旧代码
-// 的 if _, ok（键存在即跳过）当「已有」跳过，新契约归一化为 ""。
+// 的 if _, ok（键存在即跳过）当「已有」跳过，新契约归一化为非空空白占位 " "。
 // 注意 hasTrace 半边：reasoning_content 键存在本身即痕迹，门控必然亮。
 func TestBackfillNullAndNonStringNormalized(t *testing.T) {
 	cases := []struct {
 		name string
 		body string
 	}{
-		{"reasoning_content:null 归一化为空串",
+		{"reasoning_content:null 归一化为空白占位",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"assistant","content":"a","reasoning_content":null}]}`},
-		{"reasoning_content:数字 归一化为空串",
+		{"reasoning_content:数字 归一化为空白占位",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"assistant","content":"a","reasoning_content":123}]}`},
 	}
@@ -250,8 +254,8 @@ func TestBackfillNullAndNonStringNormalized(t *testing.T) {
 			if len(got) != 1 {
 				t.Fatalf("assistant 消息数 = %d want 1 (out=%s)", len(got), out)
 			}
-			if got[0] != "" || got[0] == "<absent>" {
-				t.Errorf("reasoning_content 应归一化为 \"\", got %q (out=%s)", got[0], out)
+			if got[0] != " " || got[0] == "<absent>" {
+				t.Errorf("reasoning_content 应归一化为 \" \", got %q (out=%s)", got[0], out)
 			}
 		})
 	}

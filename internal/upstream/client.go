@@ -37,6 +37,7 @@ const (
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
+	ErrReasoningMissing              // 11155 reasoning_content_missing（思考模式未回传上轮推理）→ 请求级错误：不罚号（不冷却/不熔断/不 NoteError），仍轮转（严格租户拒、宽松租户可过）
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -66,6 +67,8 @@ func (k ErrKind) String() string {
 		return "prompt_too_long"
 	case ErrImageInvalid:
 		return "image_invalid"
+	case ErrReasoningMissing:
+		return "reasoning_content_missing"
 	case ErrClient:
 		return "client"
 	default:
@@ -245,6 +248,24 @@ func isPromptTooLongStatus(status int) bool {
 	return status == http.StatusBadRequest || status == http.StatusNotFound ||
 		status == http.StatusRequestEntityTooLarge
 }
+
+// reasoningMissingRule 11155「reasoning_content_missing」判定。
+// 定位：思考模式下客户端未把上一轮推理原样带回（上游 extError.code =
+// reasoning_content_missing，HTTP 400，type=invalid_request_error）。这是**请求的
+// 问题不是账号的问题**——同一 body 换号在严格租户一律 400、宽松租户可放过，与账号
+// 健康度无关。若不单独分类会落 ErrClient → handler 调 NoteFailures 累计连败 →
+// 三个 global 号全被判死 → 池空 503 no_healthy_account（本仓实测的雪崩形态）。
+// marker 双通道：
+//   - `"code":11155` / `"code":"11155"`：业务信封 code（JSON 空格容差）；
+//   - "reasoning_content_missing" / 文案：extError 兜底（大小写不敏感）。
+//
+// 只在 400 上判（该错误固定 400；429/5xx 属限流/服务端故障优先）。
+var reasoningMissingRule = errorRule{kind: ErrReasoningMissing, mode: matchFold, patterns: []string{
+	`"code":11155`,
+	`"code":"11155"`,
+	"reasoning_content_missing",
+	"reasoning content from the previous turn must be passed back",
+}}
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -583,6 +604,12 @@ func Classify(status int, body string) ErrKind {
 	// 429/5xx 在上方已被各自状态码层短路（限流/服务端故障语义优先）。
 	if isPromptTooLongStatus(status) && promptTooLongRule.hit(body, lower) {
 		return ErrPromptTooLong
+	}
+	// 11155「reasoning_content_missing」：思考模式未回传上轮推理 —— 请求级语义，
+	// 判在通用 4xx 兜底之前（否则落 ErrClient → NoteFailures 连败 → 团灭 global 池）。
+	// 只认 400（见 reasoningMissingRule）。
+	if status == http.StatusBadRequest && reasoningMissingRule.hit(body, lower) {
+		return ErrReasoningMissing
 	}
 	if status == http.StatusNotFound {
 		return ErrNotFound

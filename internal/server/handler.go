@@ -1089,6 +1089,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrImageInvalid:
 		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
 		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
+	case upstream.ErrReasoningMissing:
+		// 11155 reasoning_content_missing（思考模式未回传上轮推理）：请求级错误，
+		// 严格租户一律 400、宽松租户可放过——与账号健康无关，绝不能喂连败
+		// （否则 3 个 global 号被 NoteFailures 逐个判死 → 池空 503 no_healthy_account）。
+		// 零惩罚（不冷却/不熔断/不 NoteError），但**仍然轮转**：换到宽松租户仍可能成功。
+		// 网关侧 backfillReasoningContent 已尽力补齐 reasoning_content 非空，此处是兜底。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，

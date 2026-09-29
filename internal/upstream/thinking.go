@@ -121,25 +121,26 @@ func backfillReasoningContent(obj map[string]any) {
 		if role != "assistant" {
 			continue
 		}
+		// rc 来源：已有非空 reasoning_content 优先；否则复制非空 reasoning；否则空。
 		rc, hasRC := msg["reasoning_content"].(string)
-		if hasRC {
-			// rc 已有 string → 不覆盖（原有语义保留）。
-		} else if r, ok := msg["reasoning"].(string); ok {
-			rc = r
-			msg["reasoning_content"] = rc
-		} else {
-			rc = ""
-			msg["reasoning_content"] = rc
+		if !hasRC || rc == "" {
+			if r, ok := msg["reasoning"].(string); ok && r != "" {
+				rc = r
+			}
 		}
-		// 镜像：reasoning 缺失/null/空串 → 归一化（非空 rc 优先，皆无补 " "）。
+		// 关键（11155 reasoning_content_missing）：reasoning_content 缺失/空串时补
+		// 空白占位。上游兜底见到 reasoning_content 字段已存在即跳过，空串会原样落到
+		// 严格租户的 len(reasoning_content)>0 校验上 → HTTP 400 code=11155；空白串
+		// 过闸（与 #165 对 reasoning 字段已实测的「空白串 200」同口径）。
+		if rc == "" {
+			rc = " "
+		}
+		msg["reasoning_content"] = rc
+		// 镜像：reasoning 缺失/null/空串 → 归一化（两字段最终都存在且非空）。
 		if r, ok := msg["reasoning"].(string); ok && r != "" {
 			continue // 已非空 → 不覆盖
 		}
-		if rc != "" {
-			msg["reasoning"] = rc
-		} else {
-			msg["reasoning"] = " "
-		}
+		msg["reasoning"] = rc
 	}
 }
 
