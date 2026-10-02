@@ -49,6 +49,14 @@ cp .tmp_sync/preserved/.gitattributes ./
 cp .tmp_sync/preserved/sync.sh ./
 rm -rf .tmp_sync
 
+# 剔除本 fork 明确不要的上游 workflow。
+# 上游快照自带 .github/workflows/ai-governance.yml，上面的 cp 是"合并"而非"替换"，
+# 所以它会被重新带回来；本 fork 已在 60518cf 把它删掉。
+# 带回来的后果不只是多一个文件：Actions 的 GITHUB_TOKEN 默认没有 workflows 权限，
+# git push 会被 remote rejected（refusing to allow a GitHub App to create or update
+# workflow ... without `workflows` permission），整个同步任务因此失败。
+rm -f .github/workflows/ai-governance.yml
+
 # 统一行尾为 LF
 find . -type f -not -path "*/.git/*" -not -path "*/patches/*" -name "*.go" -exec perl -pi -e 's/\r\n/\n/g' {} +
 find . -type f -not -path "*/.git/*" -not -path "*/patches/*" -name "*.sh" -exec perl -pi -e 's/\r\n/\n/g' {} +
