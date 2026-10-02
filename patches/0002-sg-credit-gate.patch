@@ -1,0 +1,1780 @@
+diff --git a/cmd/server/config.go b/cmd/server/config.go
+index 06b2e0d..af989d0 100644
+--- a/cmd/server/config.go
++++ b/cmd/server/config.go
+@@ -139,6 +139,22 @@ type Config struct {
+ 		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
+ 		// 空值回落默认。
+ 		CostExploreInterval string `json:"cost_explore_interval"`
++		// SG 积分闸门（patch 0002）：global 域的付费模型（如 deepseek-v4.1-flash-sg）
++		// 与免费模型共用同一批账号，付费模型打空积分会让账号整体撞 402 → 账号级
++		// 硬冷却 → 免费池一起死。闸门把"余额不足的号"只从付费模型的候选集里摘掉，
++		// 其余模型不受影响，因此免费池规模与付费池规模解耦。
++		//   enabled          false = 完全关闭（回到引入前行为）
++		//   model            闸门锁定的模型名（精确匹配请求模型名，含 -sg 后缀）
++		//   min_credits      余额低于此值 → 摘除该模型请求（默认 50）
++		//   resume_credits   余额回到此值以上才恢复（默认 120，须 >= min_credits）
++		//   realm            生效域，默认 "global"；"*" = 全域
++		SGGate struct {
++			Enabled       bool   `json:"enabled"`
++			Model         string `json:"model"`
++			MinCredits    int64  `json:"min_credits"`
++			ResumeCredits int64  `json:"resume_credits"`
++			Realm         string `json:"realm"`
++		} `json:"sg_gate"`
+ 	} `json:"pool"`
+ 
+ 	SessionSticky struct {
+@@ -159,6 +175,9 @@ type Config struct {
+ 	ExpiringSoonDur     time.Duration `json:"-"`
+ 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
+ 	CostExploreIntervalDur time.Duration `json:"-"`
++	// BillingIntervalDur 解析后的积分轮询间隔（schedule.billing_interval，默认 30m）。
++	// 下限钳制在 scheduler.New 里做（那里能打 WARN），此处只负责解析与回落。
++	BillingIntervalDur time.Duration `json:"-"`
+ }
+ 
+ // Default 默认配置。
+@@ -204,6 +223,15 @@ func Default() *Config {
+ 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+ 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
+ 	c.Pool.CostExploreInterval = "30m"
++	// SG 积分闸门默认值（patch 0002）：默认**关闭**（enabled=false）——升级后行为
++	// 与引入前逐字一致，是否启用由运维在 config.json 显式打开。model 预填用户实际
++	// 使用的付费模型名，开启时无需再查；阈值 50/120 为运维口径（低于 50 摘除，
++	// 回到 120 以上才恢复）——配合 30m 的核查间隔，留出两次核查之间被打穿的余量。
++	c.Pool.SGGate.Enabled = false
++	c.Pool.SGGate.Model = "deepseek-v4.1-flash-sg"
++	c.Pool.SGGate.MinCredits = 50
++	c.Pool.SGGate.ResumeCredits = 120
++	c.Pool.SGGate.Realm = "global"
+ 	c.SessionSticky.Enabled = true
+ 	c.SessionSticky.TTL = "30m"
+ 	c.SessionSticky.GCInterval = "5m"
+@@ -382,6 +410,34 @@ func (c *Config) normalize() error {
+ 	if c.CostExploreIntervalDur < 0 {
+ 		c.CostExploreIntervalDur = 0
+ 	}
++	// 积分轮询间隔（schedule.billing_interval，默认 "30m"）：空值回落默认（Default 已置；
++	// 此兜底覆盖显式 ""）。解析失败快速失败——间隔直接决定闸门的最坏漏检窗口，
++	// 静默回落默认会让运维以为配生效了。下限（scheduler.defaultBillingMinInterval）
++	// 不在这里钳：那里能打 WARN 说明"配小了"，静默钳会让配置看起来生效。
++	if c.Schedule.BillingInterval == "" {
++		c.Schedule.BillingInterval = "30m"
++	}
++	if c.BillingIntervalDur, err = time.ParseDuration(c.Schedule.BillingInterval); err != nil {
++		return fmt.Errorf("schedule.billing_interval: %w", err)
++	}
++	// SG 积分闸门归一（patch 0002）：只做「取值合法化」，**不**在这里改变 enabled
++	// 语义——enabled=false 一律保持关闭（即使 model/min_credits 有值）。
++	//   - min_credits <= 0 → 回落 50（阈值 0 无意义，会让闸门永不触发）
++	//   - resume_credits < min_credits → 钳到 min_credits（滞回窗口退化但不出错）
++	//   - realm 空 → "global"（本闸门的设计目标域）
++	//   - model 空 → "deepseek-v4.1-flash-sg"（缺省目标模型）
++	if c.Pool.SGGate.MinCredits <= 0 {
++		c.Pool.SGGate.MinCredits = 50
++	}
++	if c.Pool.SGGate.ResumeCredits < c.Pool.SGGate.MinCredits {
++		c.Pool.SGGate.ResumeCredits = c.Pool.SGGate.MinCredits
++	}
++	if c.Pool.SGGate.Realm == "" {
++		c.Pool.SGGate.Realm = "global"
++	}
++	if c.Pool.SGGate.Model == "" {
++		c.Pool.SGGate.Model = "deepseek-v4.1-flash-sg"
++	}
+ 	if c.Upstream.TimeoutSeconds <= 0 {
+ 		c.Upstream.TimeoutSeconds = 120
+ 	}
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index e2be0b8..00059e0 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -85,6 +85,10 @@ func main() {
+ 	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+ 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+ 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
++	// SG 积分闸门（patch 0002）：把余额不足的账号只从付费模型的候选集摘掉，
++	// 免费模型不受影响。enabled=false（默认）时完全关闭，行为与引入前一致。
++	p.SetSGGate(cfg.Pool.SGGate.Enabled, cfg.Pool.SGGate.Model,
++		cfg.Pool.SGGate.MinCredits, cfg.Pool.SGGate.ResumeCredits, cfg.Pool.SGGate.Realm)
+ 
+ 	// 会话粘性路由（可配关闭）。
+ 	var sessRouter *session.Router
+@@ -155,12 +159,14 @@ func main() {
+ 		CatHours:            cfg.Schedule.CatHours,
+ 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
+ 		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
++		BillingInterval:     cfg.BillingIntervalDur,
+ 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
+ 		TravelDisabled:      !cfg.Schedule.TravelEnabled,
+ 		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
+ 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
+ 		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
+ 		CatDisabled:         !cfg.Schedule.CatEnabled,
++		BillingDisabled:     !cfg.Schedule.BillingEnabled,
+ 	})
+ 	switch {
+ 	case !cfg.Schedule.CheckinEnabled:
+@@ -195,6 +201,19 @@ func main() {
+ 	} else {
+ 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
+ 	}
++	// SG 积分闸门启动回执：一眼确认闸门是开是关、锁的哪个模型、阈值多少。
++	if cfg.Pool.SGGate.Enabled {
++		log.Printf("SG 积分闸门已启用：模型=%s 域=%s 余额<%d 摘除 / 余额>=%d 恢复",
++			cfg.Pool.SGGate.Model, cfg.Pool.SGGate.Realm,
++			cfg.Pool.SGGate.MinCredits, cfg.Pool.SGGate.ResumeCredits)
++	} else {
++		log.Printf("SG 积分闸门未启用（pool.sg_gate.enabled=false）")
++	}
++	if !cfg.Schedule.BillingEnabled {
++		log.Printf("积分轮询已禁用（schedule.billing_enabled=false）——global 账号余额将不再刷新")
++	} else {
++		log.Printf("积分轮询已启用：每 %s 一轮（全域余额核查，global 账号的唯一余额来源）", cfg.BillingIntervalDur)
++	}
+ 
+ 	h := server.NewHandler(server.Config{
+ 		Pool:         p,
+diff --git a/internal/config/schedule.go b/internal/config/schedule.go
+index 2edcb3f..3b353d3 100644
+--- a/internal/config/schedule.go
++++ b/internal/config/schedule.go
+@@ -6,13 +6,20 @@
+ // 两个命令共用同一份定义，消除漂移源头。
+ package config
+ 
+-import "fmt"
++import (
++	"fmt"
++	"time"
++)
+ 
+ // Schedule 排程配置段（对应 config.json 的 "schedule" 对象）。
+ //
+-// 六类独立排程：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子。
+-// cmd/server 与 cmd/activity 共用本结构，默认值由 DefaultSchedule 填充、
+-// 缺省归一由 Normalize 完成——两命令走同一份语义，不再各自复制。
++// 七类独立排程：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子 /
++// 积分轮询（billing，patch 0002）。cmd/server 与 cmd/activity 共用本结构，默认值由
++// DefaultSchedule 填充、缺省归一由 Normalize 完成——两命令走同一份语义，不再各自复制。
++//
++// billing 为何用「间隔时长」而不是像其余六类那样的整点小时表：积分轮询的价值在于
++// 把 SG 闸门的最坏漏检窗口压到可接受范围，槽位必须能落在半点（如 :30）上；
++// 整点小时表表达不了 :30，所以单独走 BillingInterval（见 scheduler.fixedIntervalSlots）。
+ type Schedule struct {
+ 	CheckinHours   []int `json:"checkin_hours"`   // [9,21]
+ 	TravelHours    []int `json:"travel_hours"`    // [9,21]
+@@ -35,6 +42,13 @@ type Schedule struct {
+ 	KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
+ 	SchoolEnabled    bool `json:"school_enabled"`    // 缺省 true；false = 停开学季任务
+ 	CatEnabled       bool `json:"cat_enabled"`       // 缺省 true；false = 停夜猫子任务
++	// BillingInterval 积分轮询间隔（patch 0002），默认 "30m"。写成时长而非整点
++	// 小时表：轮询槽位要能落在半点上（见类型注释）。下限由 scheduler 钳（默认 10m，
++	// 低于下限打 WARN 后钳到下限）——此处只做解析与空值回落。
++	BillingInterval string `json:"billing_interval"` // "30m"
++	// BillingEnabled 积分轮询开关，缺省 true。false = 完全停轮询：global 账号的
++	// 余额将不再刷新（creditsKnown 停在最后已知值，SG 闸门失去判据）。
++	BillingEnabled bool `json:"billing_enabled"` // 缺省 true；false = 停积分轮询
+ 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
+ 	// 默认 5 条把 chat_5 刷满；0/缺省=1 兼容旧行为。
+ 	ActivityReportCount int `json:"activity_report_count"`
+@@ -61,6 +75,8 @@ func DefaultSchedule() Schedule {
+ 		KeepaliveEnabled:    true,
+ 		SchoolEnabled:       true,
+ 		CatEnabled:          true,
++		BillingInterval:     "30m",
++		BillingEnabled:      true,
+ 		ActivityReportCount: 5, // 领猫前置需 5 次对话，5 连发刷满 chat_5
+ 	}
+ }
+@@ -92,6 +108,10 @@ func (s *Schedule) Normalize() error {
+ 	if len(s.CatHours) == 0 {
+ 		s.CatHours = []int{1}
+ 	}
++	// billing 间隔空值回落默认 30m（键缺席时 DefaultSchedule 已置值，此兜底覆盖显式 ""）。
++	if s.BillingInterval == "" {
++		s.BillingInterval = "30m"
++	}
+ 	// 0/负数 → 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
+ 	if s.ActivityReportCount <= 0 {
+ 		s.ActivityReportCount = 1
+@@ -120,7 +140,16 @@ func (s *Schedule) validateHours() error {
+ 	if err := checkHourRange("schedule.school_hours", "school_enabled", s.SchoolHours); err != nil {
+ 		return err
+ 	}
+-	return checkHourRange("schedule.cat_hours", "cat_enabled", s.CatHours)
++	if err := checkHourRange("schedule.cat_hours", "cat_enabled", s.CatHours); err != nil {
++		return err
++	}
++	// billing 间隔必须是合法时长（如 "30m"）。这里快速失败而不是静默回落默认：
++	// 轮询间隔直接决定 SG 闸门的最坏漏检窗口，静默回落会让运维以为配的值生效了。
++	// 下限（scheduler.defaultBillingMinInterval）不在这里钳——那里能打 WARN。
++	if _, err := time.ParseDuration(s.BillingInterval); err != nil {
++		return fmt.Errorf("schedule.billing_interval: %q 不是合法时长（如 \"30m\"）: %w", s.BillingInterval, err)
++	}
++	return nil
+ }
+ 
+ func checkHourRange(field, switchKey string, hours []int) error {
+diff --git a/internal/pool/cooldown.go b/internal/pool/cooldown.go
+index d363d89..cf8c5f6 100644
+--- a/internal/pool/cooldown.go
++++ b/internal/pool/cooldown.go
+@@ -38,6 +38,11 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, expiring int64) {
+ 		}
+ 		e.credits = credits
+ 		e.creditsExpiring = expiring
++		// 权威余额到达：标记 creditsKnown 并按滞回阈值重算 SG 闸门位（gate.go）。
++		// 这是「余额未知 → 保守进闸」的唯一出口——首次 billing 轮询/签到后真实余额
++		// 即生效，余额充足的号立刻恢复付费模型可用（不必等重启或人工干预）。
++		e.creditsKnown = true
++		p.applySGGateLocked(e)
+ 		p.dirty.Store(true)
+ 	}
+ }
+diff --git a/internal/pool/entry.go b/internal/pool/entry.go
+index 6c5edf9..ac1465c 100644
+--- a/internal/pool/entry.go
++++ b/internal/pool/entry.go
+@@ -52,6 +52,15 @@ type Status struct {
+ 	// samples）；无观测/全部过期 → nil（tier 1 未知层）。过期即消失（零回归，
+ 	// 只读遍历零风险）。tier 不单独落字段（可由 per1k≤0 推出，零冗余）。
+ 	ModelCosts []ModelCostStatus `json:"model_costs,omitempty"`
++	// SGGated 付费模型积分闸门位（见 gate.go）：该账号当前被摘除 sgGateModel 的
++	// 请求。**刻意不做成账号级 Cooling**——闸门只锁一个模型，免费模型照常服务，
++	// 若复用 cooling 字段会让面板把账号显示成"冷却中"，与实际可用性不符。
++	// 零值也显式写出（运维口径，同 consecutive_fails）。
++	SGGated bool `json:"sg_gated"`
++	// CreditsKnown 报告 Credits 是否来自权威余额核查（见 entry.creditsKnown）。
++	// 面板据此区分"余额 0"与"余额未知（从未核查）"——前者是真没钱，后者只是没数据。
++	// 零值也显式写出（运维口径，同上）。
++	CreditsKnown bool `json:"credits_known"`
+ 	Disabled          bool               `json:"disabled"`
+ 	DisabledReason    string             `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+ 	// ManualDisabled 运维手动停用（issue #138/#118）——与 disabled **并列独立**，
+@@ -111,6 +120,18 @@ type entry struct {
+ 	// 签到之间第四因子（weightOf ×8）不应失忆——签到 09:00/21:00 定期刷新，
+ 	// 窗口外重启会丢快过期积分偏好，可能让奖励积分到期作废。
+ 	creditsExpiring int64
++	// creditsKnown 报告 credits 是否来自**权威**余额核查（billing / get-user-resource）。
++	// 为什么需要它：global 账号不签到（scheduler.CheckinAll 对 global 直接 skip），
++	// credits 只会被 NoteModelCost 的扣减路径单调压低，从来没有权威写入——一个
++	// "余额 0" 的 global 号可能实际有几百积分。若直接按 credits 判定闸门，会把
++	// 全部 global 号一刀切摘掉。故闸门只信权威值：creditsKnown=false 时保守进闸
++	// （不打付费模型），首次 billing 轮询写入权威余额后立即按真实值重算。
++	// 持久化（stateAccount.CreditsKnown）：重启后不把"已知"降级成"未知"。
++	creditsKnown bool
++	// sgGated 付费模型闸门位（见 gate.go）：为 true 时该账号从 sgGateModel 的候选集
++	// 摘除，其余模型不受影响。由 applySGGateLocked 按权威余额 + 滞回阈值唯一驱动。
++	// 持久化（stateAccount.SGGated）：否则重启会把刚摘掉的号放回付费模型，重演打空。
++	sgGated bool
+ 	successCount    int64     // 累计成功
+ 	// errTotal 累计错误（终身累计，仅状态展示用；选号权重不消费——原「成功率」
+ 	// 因子已删，见 pick.weightOf 注释与 success-ema-review）。
+@@ -394,6 +415,14 @@ type stateAccount struct {
+ 	// （weightOf ×8）的快过期积分偏好——重启后到下次签到之间不应失忆。
+ 	// 零值也显式写出（运维口径，见 err_total 注释）。
+ 	CreditsExpiring int64 `json:"credits_expiring"`
++	// CreditsKnown 报告 Credits 是否来自权威余额核查（见 entry.creditsKnown）。
++	// 持久化：重启后不把"已知"降级成"未知"，否则闸门会保守地把全部账号摘一遍。
++	// 零值也显式写出（运维口径，同上）。
++	CreditsKnown bool `json:"credits_known"`
++	// SGGated 付费模型闸门位（见 entry.sgGated / gate.go）。持久化：否则重启会把
++	// 刚摘掉的号放回付费模型，重演"打空积分连免费一起死"的原始故障。
++	// 零值也显式写出（运维口径，同上）。
++	SGGated bool `json:"sg_gated"`
+ 	// ModelCooldowns 6004 模型级独立冷却表（model → 冷却记录）。持久化：
+ 	// PR #96 把 6004 改成精确对齐上游重置墙钟后，单模型冷却可长达数小时，
+ 	// 跨重启是常态；不持久化导致每次重启 healthyForModel 失忆、重新踩一遍
+diff --git a/internal/pool/gate.go b/internal/pool/gate.go
+new file mode 100644
+index 0000000..249e4c7
+--- /dev/null
++++ b/internal/pool/gate.go
+@@ -0,0 +1,183 @@
++// SG 积分闸门：global 域免费（0 倍率）与 -sg 付费模型共用同一个账号池，
++// 而 -sg 打空积分会让账号整体撞 402 → applyErrorPolicy 走 CooldownUntilTomorrow4AM
++// （**账号级**硬冷却）→ 免费模型也一起不可用。这是「一次 -sg 把免费池打没」的根因。
++//
++// 本文件只做一件事：给**单个模型**加一道基于权威余额的软闸门——余额低于下限时，
++// 把该账号从该模型的候选集里摘掉，其余模型（免费池）完全不受影响。
++//
++// 与既有维度的正交性：
++//   - 不改 healthy/healthyForModel（账号级 + 6004 模型级冷却），另开一层 sgAllowed 谓词；
++//   - 不写 until/coolKind（那会连带影响免费模型），只置 entry.sgGated 这一个模型级状态位；
++//   - 与 modelCooldowns 并列但语义不同：那条是"上游说这个模型现在不行"（外部事实），
++//     本条是"我们自己判断这个号不该打这个模型"（内部策略），互不覆盖。
++//
++// 滞回（hysteresis）：入门阈值 sgMinCredits、恢复阈值 sgResumeCredits 分开，
++// 避免余额在阈值附近抖动导致账号反复进出闸门（参考既有 softStreak 退避的设计取向）。
++package pool
++
++import (
++	"log"
++	"time"
++
++	"workbuddy2api/internal/logfmt"
++)
++
++// 闸门三个默认值（SetSGGate 注入；0 值 = 关闭）。
++const (
++	// defaultSGMinCredits 入门阈值：余额低于此值即摘除该账号的闸门模型请求。
++	// 取 50（运维口径）：闸门只能拦住"已知余额不足"的号，拦不住两次核查之间被打穿的
++	// 号——核查间隔就是最坏漏检窗口（默认 30m）。阈值 50 是给这个窗口留的余量：
++	// 实测 -sg 单次约 0.0014~0.0057 积分（1k token），50 足以扛住一个间隔内的消耗。
++	defaultSGMinCredits = 50
++	// defaultSGResumeCredits 恢复阈值：余额回到此值以上才恢复闸门模型的请求。
++	// 取 120 = 2.4 倍入门阈值（运维口径 2026-10-02 定）：滞回窗口够宽，
++	// 避免余额在 50 附近反复横跳；又不至于把刚回血的号长期晾在闸门外。
++	defaultSGResumeCredits = 120
++	// defaultSGGateRealm 闸门生效的 realm。global 账号不签到（scheduler.CheckinAll
++	// 对 global 直接 skip），credits 曾是终身冻结的死数字，正需要本闸门兜底；
++	// CN 账号有签到兜底，默认不吃本闸门（零回归）。"*" = 全 realm 生效。
++	defaultSGGateRealm = "global"
++)
++
++// SetSGGate 注入 SG 积分闸门参数（main 从 config 解析后调用）。
++//   - model 为空 或 min <= 0 或 enabled=false → 闸门关闭（完全回到引入前行为）。
++//   - resume < min 时钳到 min（滞回窗口退化但不出错）。
++//   - realm 为空 → 回落默认 "global"；"*" 表示全 realm。
++func (p *Pool) SetSGGate(enabled bool, model string, minCredits, resumeCredits int64, realm string) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if !enabled || model == "" || minCredits <= 0 {
++		p.sgGateModel = ""
++		// 关闭闸门时清掉全池闸门位：留着 true 不影响可用性（sgAllowed 先看启用位），
++		// 但会让 /status 出现"闸门已关却显示 sg_gated=true"的误导快照。
++		for _, e := range p.byUID {
++			e.sgGated = false
++		}
++		return
++	}
++	if resumeCredits < minCredits {
++		resumeCredits = minCredits
++	}
++	if realm == "" {
++		realm = defaultSGGateRealm
++	}
++	p.sgGateModel = model
++	p.sgMinCredits = minCredits
++	p.sgResumeCredits = resumeCredits
++	p.sgGateRealm = realm
++	// 参数变更后立即按新阈值重算全池闸门位：运维调阈值不必等下一次 billing 轮询
++	// 才生效（尤其是把阈值调高让号立刻出闸的场景）。
++	p.refreshSGGateAllLocked()
++}
++
++// sgGateActiveLocked 报告闸门是否启用（配置齐全）。调用方需已持 p.mu。
++func (p *Pool) sgGateActiveLocked() bool { return p.sgGateModel != "" && p.sgMinCredits > 0 }
++
++// sgRealmMatchLocked 报告账号是否落在闸门生效的 realm 内。调用方需已持 p.mu。
++func (p *Pool) sgRealmMatchLocked(e *entry) bool {
++	if p.sgGateRealm == "" || p.sgGateRealm == "*" {
++		return true
++	}
++	return e.a.Realm() == p.sgGateRealm
++}
++
++// sgAllowed 报告账号对 reqModel 是否通过 SG 闸门。
++//
++// 恒真路径（零回归）：闸门未启用 / 请求模型为空 / 请求模型≠闸门模型 / 账号不在闸门 realm。
++// 只有"闸门模型 + 目标 realm"这一条窄路径才读 sgGated 位。
++//
++// 调用方需已持 p.mu（读锁或写锁均可，本方法只读）。
++func (p *Pool) sgAllowed(e *entry, reqModel string) bool {
++	if !p.sgGateActiveLocked() || reqModel == "" || reqModel != p.sgGateModel {
++		return true
++	}
++	if !p.sgRealmMatchLocked(e) {
++		return true
++	}
++	return !e.sgGated
++}
++
++// applySGGateLocked 按当前 credits/creditsKnown 重算单个账号的 sgGated 位（滞回）。
++// 状态迁移打日志（进闸/出闸各一行），运维可据此对账「这个号什么时候被摘的、为什么」。
++// 调用方必须已持有 p.mu。
++//
++// 判定口径：
++//   - 闸门未启用 / 账号不在闸门 realm → 恒 false（位清零，不残留）。
++//   - 余额未知（creditsKnown=false）→ 保守置 true（未知不等于有钱；新号在首次
++//     billing 轮询前不打 -sg，避免"首次 -sg 就打空"的原始故障）。首轮轮询后即可解闸。
++//   - 已进闸：余额 >= sgResumeCredits 才出闸（滞回上沿）。
++//   - 未进闸：余额 <  sgMinCredits   才进闸（滞回下沿）。
++func (p *Pool) applySGGateLocked(e *entry) {
++	if !p.sgGateActiveLocked() || !p.sgRealmMatchLocked(e) {
++		e.sgGated = false
++		return
++	}
++	was := e.sgGated
++	var now bool
++	switch {
++	case !e.creditsKnown:
++		now = true // 余额未知：保守进闸
++	case e.sgGated:
++		now = e.credits < p.sgResumeCredits // 已进闸：须回到恢复阈值才放行
++	default:
++		now = e.credits < p.sgMinCredits // 未进闸：跌破入门阈值才摘除
++	}
++	if now == was {
++		return
++	}
++	e.sgGated = now
++	p.dirty.Store(true)
++	if now {
++		reason := "credits below minimum"
++		if !e.creditsKnown {
++			reason = "credits unknown"
++		}
++		log.Printf("WARN: [pool] sg gate ON acct=%s model=%s credits=%d known=%v (%s) — 停止向该账号请求此模型",
++			logfmt.Label(e.a.UID, e.a.Nickname), p.sgGateModel, e.credits, e.creditsKnown, reason)
++	} else {
++		log.Printf("[pool] sg gate OFF acct=%s model=%s credits=%d (>=%d) — 恢复该模型的请求",
++			logfmt.Label(e.a.UID, e.a.Nickname), p.sgGateModel, e.credits, p.sgResumeCredits)
++	}
++}
++
++// refreshSGGateAllLocked 重算全池闸门位（SetSGGate 参数变更时调用）。调用方必须已持有 p.mu。
++func (p *Pool) refreshSGGateAllLocked() {
++	for _, e := range p.byUID {
++		p.applySGGateLocked(e)
++	}
++}
++
++// SGGateStatus 透出闸门配置（/status 用，运维据此确认阈值与目标模型）。
++func (p *Pool) SGGateStatus() (model string, minCredits, resumeCredits int64, realm string) {
++	p.mu.RLock()
++	defer p.mu.RUnlock()
++	return p.sgGateModel, p.sgMinCredits, p.sgResumeCredits, p.sgGateRealm
++}
++
++// ClearCreditCooldownIfRecovered 余额核查后的定向解冻：仅当账号正处 CoolHard
++// （余额耗尽硬冷却）且权威余额 > 0 时，清除冷却域。
++//
++// 为什么不直接用 ReenableIfCredits：那个是**签到**语义（签到成功 ⇒ 余额恢复 ⇒
++// 无条件清全部冷却域），CN 账号每天两次签到兜底，粗粒度无妨。而 billing 轮询是
++// **高频旁路核查**，若也清全部冷却域，会把正在生效的 429 软冷却/6004 模型级冷却
++// 一并抹掉 → 账号立刻回到 429 雷区，形成「轮询一次解冻一次、再撞一次」的循环。
++// 本方法只解 CoolHard（"没钱"这一种），其余冷却各自到期，语义精确。
++// 返回 true 表示本次确实解冻。调用方传权威余额（不写 credits，写余额走 SetCreditsDetailed）。
++func (p *Pool) ClearCreditCooldownIfRecovered(uid string, credits int64) bool {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	e, ok := p.byUID[uid]
++	if !ok || e.disabled {
++		return false
++	}
++	if e.coolKind != CoolHard || e.until.IsZero() || !time.Now().Before(e.until) {
++		return false // 不在 CoolHard 有效期内：无事可做
++	}
++	if credits <= 0 {
++		return false // 余额仍为零：维持冷却
++	}
++	p.reviveCoolingLocked(e, credits) // 与签到解冻共用原语（清冷却域，不动熔断器）
++	log.Printf("[pool] credit cooldown cleared acct=%s credits=%d — billing 核查确认余额恢复",
++		logfmt.Label(e.a.UID, e.a.Nickname), credits)
++	return true
++}
+diff --git a/internal/pool/gate_test.go b/internal/pool/gate_test.go
+new file mode 100644
+index 0000000..bbdc5e3
+--- /dev/null
++++ b/internal/pool/gate_test.go
+@@ -0,0 +1,331 @@
++// gate_test.go SG 积分闸门（patch 0002）测试：滞回、realm 作用域、
++// 免费池不受影响（核心验收）、未知余额保守进闸、持久化往返、兜底与粘性路径。
++package pool
++
++import (
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++)
++
++// sgPool 构造「2 个 global + 2 个 cn」的池并开启闸门（模型 sg-model，阈值 20/100）。
++func sgPool(t *testing.T) *Pool {
++	t.Helper()
++	withNoPickGap(t)
++	auth.SetGlobalEnabled(true)
++	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
++	p := New("")
++	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
++	p.Add(&auth.Auth{UID: "g2", Domain: "www.workbuddy.ai"})
++	p.Add(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"})
++	p.Add(&auth.Auth{UID: "cn2", Domain: "www.codebuddy.cn"})
++	p.SetCostExploreInterval(0) // 关停探索维度，隔离本测试的关注点
++	p.SetSGGate(true, "sg-model", 20, 100, "global")
++	return p
++}
++
++// TestSGGateFreePoolUnaffected 核心验收：闸门只缩小付费模型的候选集，
++// 免费模型的候选集**一个都不少**。
++//
++// 场景正是用户描述的："SG 池子变成 3 个的时候，免费池还是 5 个"。
++// 这里用 2 个 global 号模拟：一个余额耗尽被摘、一个余额充足留用；
++// 免费模型下两个都必须还在。
++func TestSGGateFreePoolUnaffected(t *testing.T) {
++	p := sgPool(t)
++	p.SetCreditsDetailed("g1", 5, 0)    // 低于 20 → 摘除 sg-model
++	p.SetCreditsDetailed("g2", 5000, 0) // 充足 → 留用
++
++	// 付费模型：只剩 g2（g1 被闸门摘掉）。
++	for i := 0; i < 30; i++ {
++		a := p.PickExcludingForRealm(nil, "sg-model", "global")
++		if a == nil || a.UID != "g2" {
++			t.Fatalf("第 %d 次 sg-model 选中 %v，want g2（g1 余额不足应被摘）", i, a)
++		}
++	}
++
++	// 免费模型：两个 global 号都必须可选（闸门不得外溢到其他模型）。
++	seen := map[string]int{}
++	for i := 0; i < 60; i++ {
++		a := p.PickExcludingForRealm(nil, "free-model", "global")
++		if a == nil {
++			t.Fatal("free-model 选号返回 nil：免费池被闸门误伤")
++		}
++		seen[a.UID]++
++	}
++	if seen["g1"] == 0 || seen["g2"] == 0 {
++		t.Fatalf("免费模型分布 %v，want g1/g2 都出现（免费池必须完整）", seen)
++	}
++}
++
++// TestSGGateHysteresis 滞回：跌破 20 才进闸，须回到 100 以上才出闸；
++// 20~99 之间维持现状，不抖动。
++func TestSGGateHysteresis(t *testing.T) {
++	p := sgPool(t)
++	p.SetCreditsDetailed("g1", 19, 0) // < 20 → 进闸
++	if !sgGatedOf(p, "g1") {
++		t.Fatal("余额 19 应进闸")
++	}
++	// 回升到 20~99：仍在闸内（滞回上沿是 100）。
++	for _, c := range []int64{20, 50, 99} {
++		p.SetCreditsDetailed("g1", c, 0)
++		if !sgGatedOf(p, "g1") {
++			t.Fatalf("余额 %d 仍在滞回窗口内，应保持进闸（恢复阈值 100）", c)
++		}
++	}
++	// 回到 100：出闸。
++	p.SetCreditsDetailed("g1", 100, 0)
++	if sgGatedOf(p, "g1") {
++		t.Fatal("余额 100 应出闸（>= resume_credits）")
++	}
++	// 再次跌破：重新进闸（且这次是从"已出闸"状态进入，走的是下沿 20）。
++	p.SetCreditsDetailed("g1", 19, 0)
++	if !sgGatedOf(p, "g1") {
++		t.Fatal("出闸后再次跌破 20 应重新进闸")
++	}
++	// 出闸后停在 50：不应进闸（下沿是 20，不是 100）。
++	p.SetCreditsDetailed("g1", 100, 0)
++	p.SetCreditsDetailed("g1", 50, 0)
++	if sgGatedOf(p, "g1") {
++		t.Fatal("已出闸的号在 50 不应进闸（下沿 20）")
++	}
++}
++
++// TestSGGateUnknownCreditsConservative 余额未知（从未权威核查）→ 保守进闸；
++// 首次权威余额到达后按真实值重算。这是 global 账号（不签到、credits 曾是死数字）
++// 能被正确对待的关键。
++func TestSGGateUnknownCreditsConservative(t *testing.T) {
++	p := sgPool(t)
++	p.SetCreditsDetailed("g2", 5000, 0) // g2 已有权威余额，留用
++	// g1 从未核查 → creditsKnown=false → 保守进闸。
++	if !sgGatedOf(p, "g1") {
++		t.Fatal("余额未知的新号应保守进闸（不打付费模型）")
++	}
++	if a := p.PickExcludingForRealm(nil, "sg-model", "global"); a == nil || a.UID != "g2" {
++		t.Fatalf("sg-model 选中 %v，want g2（g1 余额未知应被挡）", a)
++	}
++	// 权威核查到达且余额充足 → 立即解闸，无需重启或人工干预。
++	p.SetCreditsDetailed("g1", 800, 0)
++	if sgGatedOf(p, "g1") {
++		t.Fatal("权威余额 800 到达后应立即出闸")
++	}
++	// 权威核查到达但余额仍低 → 保持进闸（这是"未知"到"真穷"的正常过渡）。
++	p.SetCreditsDetailed("g1", 3, 0)
++	if !sgGatedOf(p, "g1") {
++		t.Fatal("权威余额 3 应保持进闸")
++	}
++}
++
++// TestSGGateRealmScoped cn 账号不在闸门作用域内：余额再低也不被摘。
++// （CN 有签到兜底，本闸门默认只管 global；这是"零回归"的边界。）
++func TestSGGateRealmScoped(t *testing.T) {
++	p := sgPool(t)
++	p.SetCreditsDetailed("cn1", 0, 0)
++	p.SetCreditsDetailed("cn2", 0, 0)
++	for i := 0; i < 30; i++ {
++		a := p.PickExcludingForRealm(nil, "sg-model", "cn")
++		if a == nil {
++			t.Fatal("cn 账号余额 0 也被摘：闸门 realm 作用域失效")
++		}
++	}
++	// 闸门位对 cn 账号恒 false（不残留）。
++	if sgGatedOf(p, "cn1") {
++		t.Fatal("cn 账号不应被置 sgGated")
++	}
++}
++
++// TestSGGateDisabledNoop 闸门关闭（enabled=false）时完全回到引入前行为：
++// 余额 0 的 global 号照常参与付费模型选号。
++func TestSGGateDisabledNoop(t *testing.T) {
++	withNoPickGap(t)
++	auth.SetGlobalEnabled(true)
++	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
++	p := New("")
++	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
++	p.SetCostExploreInterval(0)
++	p.SetSGGate(false, "sg-model", 20, 100, "global") // 关闭
++	p.SetCreditsDetailed("g1", 0, 0)
++	if sgGatedOf(p, "g1") {
++		t.Fatal("闸门关闭时不应置 sgGated")
++	}
++	if a := p.PickExcludingForRealm(nil, "sg-model", "global"); a == nil || a.UID != "g1" {
++		t.Fatalf("闸门关闭时 g1 应可选，got %v", a)
++	}
++}
++
++// TestSGGatePersistRoundTrip 闸门位与 creditsKnown 跨重启保留：
++// 否则重启会把刚摘掉的号放回付费模型，重演"打空积分连免费一起死"。
++func TestSGGatePersistRoundTrip(t *testing.T) {
++	dir := t.TempDir()
++	fp := dir + "/state.json"
++	p := New(fp)
++	auth.SetGlobalEnabled(true)
++	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
++	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
++	p.Add(&auth.Auth{UID: "g2", Domain: "www.workbuddy.ai"})
++	p.SetCostExploreInterval(0)
++	p.SetSGGate(true, "sg-model", 20, 100, "global")
++	p.SetCreditsDetailed("g1", 5, 0)   // 进闸
++	p.SetCreditsDetailed("g2", 900, 0) // 出闸
++	p.Flush()
++
++	p2 := New(fp)
++	p2.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
++	p2.Add(&auth.Auth{UID: "g2", Domain: "www.workbuddy.ai"})
++	// 注入配置后重算：g1 仍是 5（进闸），g2 仍是 900（出闸）。
++	p2.SetCostExploreInterval(0)
++	p2.SetSGGate(true, "sg-model", 20, 100, "global")
++	if !sgGatedOf(p2, "g1") {
++		t.Fatal("g1 的闸门位未跨重启保留（余额 5）")
++	}
++	if sgGatedOf(p2, "g2") {
++		t.Fatal("g2 不应进闸（余额 900）")
++	}
++	// creditsKnown 也应保留（否则会被当成"未知"重新保守进闸一遍）。
++	if !creditsKnownOf(p2, "g1") {
++		t.Fatal("creditsKnown 未跨重启保留")
++	}
++}
++
++// TestSGGateFallbackExcludesGated 全冷却兜底路径同样不得放行被摘除的号：
++// 否则 normal 阶段被正确摘掉的号会在"全池冷却"时从兜底漏回付费模型。
++//
++// 对照设计：g1（余额不足，闸门摘除）+ g2（6004 模型级冷却）——
++// normal 无候选，走兜底；付费模型下两者都不该被选中（g1 被闸门挡、g2 被模型冷却挡），
++// 而免费模型下 g2 的模型冷却不适用，兜底应能选中它（闸门只管 sg-model）。
++func TestSGGateFallbackExcludesGated(t *testing.T) {
++	p := sgPool(t)
++	p.SetCreditsDetailed("g1", 1, 0)    // 进闸
++	p.SetCreditsDetailed("g2", 5000, 0) // 留用
++	// g2 对 sg-model 处于 6004 模型级冷却（账号整体仍健康）→ normal 无候选。
++	p.CooldownSoftForModel("g2", time.Minute, time.Now().Add(time.Hour), "sg-model", "6004 model rate limit")
++	if a := p.PickExcludingForRealm(nil, "sg-model", "global"); a != nil {
++		t.Fatalf("兜底选中 %v，want nil（g1 被闸门摘、g2 对 sg-model 模型级冷却）", a)
++	}
++	// 对照：免费模型下 g2 的 sg-model 冷却不适用（g1 也未被闸门摘）→ 兜底有候选。
++	// 注意此时两个号账号级都健康，走的是 normal 而非兜底，故断言"能选到号"即可。
++	if a := p.PickExcludingForRealm(nil, "free-model", "global"); a == nil {
++		t.Fatal("免费模型不应为空（g1/g2 账号级都健康，sg-model 冷却不外溢）")
++	}
++}
++
++// TestSGGateFallbackPathExcludesGated 直接锚定兜底函数本身：当全池都进冷却、
++// 只剩被闸门摘除的号时，付费模型的兜底必须返回 nil（而不是把闸门号放回去）。
++func TestSGGateFallbackPathExcludesGated(t *testing.T) {
++	p := sgPool(t)
++	p.SetCreditsDetailed("g1", 1, 0)    // 进闸
++	p.SetCreditsDetailed("g2", 5000, 0) // 未进闸
++	// 两个号都进账号级软冷却 → normal 无候选，强制走兜底。
++	p.Cooldown("g1", CoolSoft, time.Minute, "429 rate limit")
++	p.Cooldown("g2", CoolSoft, time.Minute, "429 rate limit")
++	// 免费模型：兜底可选（两个号都未被闸门摘，冷却中允许兜底）。
++	if a := p.PickExcludingForRealm(nil, "free-model", "global"); a == nil {
++		t.Fatal("免费模型兜底应能选中冷却中的号")
++	}
++	// 付费模型：g1 被闸门摘，g2 是唯一合法兜底候选。
++	// 把 g2 也摘掉（余额降到阈值下）后，兜底必须为空——证明闸门在兜底路径生效。
++	p.SetCreditsDetailed("g2", 1, 0)
++	if a := p.PickExcludingForRealm(nil, "sg-model", "global"); a != nil {
++		t.Fatalf("付费模型兜底选中 %v，want nil（两号都被闸门摘）", a)
++	}
++}
++
++// TestSGGateStickyAndAvailable 粘性命中与可用集合两条旁路同样尊重闸门：
++// 否则被摘除的号会被绑定会话持续打付费模型。
++func TestSGGateStickyAndAvailable(t *testing.T) {
++	p := sgPool(t)
++	p.SetCreditsDetailed("g1", 1, 0)    // 进闸
++	p.SetCreditsDetailed("g2", 5000, 0) // 留用
++
++	if a := p.PickByUIDForModel("g1", "sg-model"); a != nil {
++		t.Fatalf("粘性命中放行了被摘除的 g1：%v", a)
++	}
++	if a := p.PickByUIDForModel("g2", "sg-model"); a == nil {
++		t.Fatal("粘性命中误伤了未进闸的 g2")
++	}
++	// 免费模型下粘性命中不受影响。
++	if a := p.PickByUIDForModel("g1", "free-model"); a == nil {
++		t.Fatal("免费模型的粘性命中被闸门误伤")
++	}
++	// 可用集合：sg-model 下不含 g1，free-model 下含 g1。
++	if uids := p.AvailableUIDsForModelRealm("sg-model", "global"); len(uids) != 1 || uids[0] != "g2" {
++		t.Fatalf("AvailableUIDsForModelRealm(sg-model)=%v want [g2]", uids)
++	}
++	if uids := p.AvailableUIDsForModelRealm("free-model", "global"); len(uids) != 2 {
++		t.Fatalf("AvailableUIDsForModelRealm(free-model)=%v want 2 个", uids)
++	}
++}
++
++// TestSGGateThresholdChangeRecomputes 运维改阈值后立即重算全池闸门位
++// （不必等下一轮 billing 轮询）：把 min 调高应立刻摘掉边缘号。
++func TestSGGateThresholdChangeRecomputes(t *testing.T) {
++	p := sgPool(t)
++	// 先给一个充足的权威余额让 g1 脱离"未知→保守进闸"的初始态（滞回上沿 100）。
++	p.SetCreditsDetailed("g1", 150, 0)
++	if sgGatedOf(p, "g1") {
++		t.Fatal("余额 150 应出闸")
++	}
++	p.SetCreditsDetailed("g1", 50, 0) // 阈值 20 下 50 >= 20 → 不进闸
++	if sgGatedOf(p, "g1") {
++		t.Fatal("余额 50 在阈值 20 下不应进闸")
++	}
++	// 阈值抬到 100：50 < 100 → 立刻进闸。
++	p.SetSGGate(true, "sg-model", 100, 200, "global")
++	if !sgGatedOf(p, "g1") {
++		t.Fatal("阈值抬到 100 后余额 50 应立即进闸（重算未生效）")
++	}
++	// 阈值回落 20：50 >= 20 → 立刻出闸（恢复阈值同样回落到 100，50 < 100，
++	// 故这里必须走"未进闸"分支判定——先证明重算确实按新下沿放行）。
++	p.SetSGGate(true, "sg-model", 20, 20, "global")
++	if sgGatedOf(p, "g1") {
++		t.Fatal("阈值回落到 20/20 后余额 50 应立即出闸（重算未生效）")
++	}
++}
++
++// TestClearCreditCooldownIfRecovered 余额核查后的定向解冻：
++// 只解 CoolHard（"没钱"），不碰 CoolSoft（429）。
++func TestClearCreditCooldownIfRecovered(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.Add(&auth.Auth{UID: "u2"})
++
++	// u1：余额耗尽硬冷却 → 核查发现余额恢复 → 解冻。
++	p.CooldownUntilTomorrow4AM("u1", "余额不足")
++	if !p.ClearCreditCooldownIfRecovered("u1", 500) {
++		t.Fatal("CoolHard 且余额 > 0 应解冻")
++	}
++	if st := statusByUID(t, p, "u1"); st.Cooling {
++		t.Fatalf("u1 解冻后仍显示 cooling：%+v", st)
++	}
++
++	// u2：软冷却（429）→ 核查不应对它解冻（否则解冻即撞 429 循环）。
++	p.CooldownSoftRate("u2", time.Minute, time.Time{}, "429 rate limit")
++	if p.ClearCreditCooldownIfRecovered("u2", 500) {
++		t.Fatal("CoolSoft 不应被 billing 核查解冻")
++	}
++	if st := statusByUID(t, p, "u2"); !st.Cooling {
++		t.Fatalf("u2 的软冷却被误清：%+v", st)
++	}
++
++	// 余额仍为 0：不解冻（钱没回来）。
++	p.CooldownUntilTomorrow4AM("u1", "余额不足")
++	if p.ClearCreditCooldownIfRecovered("u1", 0) {
++		t.Fatal("余额 0 不应解冻")
++	}
++}
++
++// --- helpers ---
++
++func sgGatedOf(p *Pool, uid string) bool {
++	p.mu.RLock()
++	defer p.mu.RUnlock()
++	e, ok := p.byUID[uid]
++	return ok && e.sgGated
++}
++
++func creditsKnownOf(p *Pool, uid string) bool {
++	p.mu.RLock()
++	defer p.mu.RUnlock()
++	e, ok := p.byUID[uid]
++	return ok && e.creditsKnown
++}
+diff --git a/internal/pool/persist.go b/internal/pool/persist.go
+index 84ca3e7..029c540 100644
+--- a/internal/pool/persist.go
++++ b/internal/pool/persist.go
+@@ -183,6 +183,12 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
+ 			sessionDeadFails: s.SessionDeadFails,
+ 			consecutiveFails: s.ConsecutiveFails,
+ 			creditsExpiring:  expiring,
++			// 闸门位与"余额是否权威"随状态一起恢复（gate.go）：否则重启会把刚摘掉的
++			// 号放回付费模型重演打空，并把"已核查"降级成"未知"导致全池保守进闸。
++			// 恢复的是**上次的判定结果**；main 注入配置时 SetSGGate 会按当前阈值重算，
++			// 所以改了阈值不必等重启后的下一轮轮询。
++			creditsKnown: s.CreditsKnown,
++			sgGated:      s.SGGated,
+ 		}
+ 		// 恢复熔断器：breakerUntil 在未来才恢复（惰性过滤过期/零值，与落盘同口径）。
+ 		// retryCount 仅在 breakerUntil 未过期时恢复——已过期则归零（不保留无用退避指数）。
+@@ -430,6 +436,8 @@ func (p *Pool) stateOverviewLocked() stateFile {
+ 			BreakerUntil:     breakerUntil,
+ 			RetryCount:       retryCount,
+ 			CreditsExpiring:  e.creditsExpiring,
++			CreditsKnown:     e.creditsKnown,
++			SGGated:          e.sgGated,
+ 			ModelCooldowns:   mcs,
+ 			ModelCosts:       mcosts,
+ 		}
+diff --git a/internal/pool/pick.go b/internal/pool/pick.go
+index 5db4818..3051802 100644
+--- a/internal/pool/pick.go
++++ b/internal/pool/pick.go
+@@ -58,6 +58,13 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+ 		if !healthyOf(e) {
+ 			continue
+ 		}
++		// SG 积分闸门（gate.go）：闸门模型 + 目标 realm 的账号若被摘除，不进候选。
++		// 恒真路径（闸门未启用/模型不匹配）零开销，且**不**影响其余模型的候选集
++		// ——这正是"付费池缩到 3 个而免费池仍是 5 个"的实现点：闸门只作用于
++		// reqModel == sgGateModel 这一次选号，别的模型走的是另一条 pick 调用。
++		if !p.sgAllowed(e, reqModel) {
++			continue
++		}
+ 		if p.inFlightFull(e) {
+ 			continue // 在途占满：跳过（max=0 不限时不触发）
+ 		}
+@@ -66,7 +73,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+ 	if len(cands) == 0 {
+ 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
+ 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
+-		return p.pickEarliestExpiryLocked(tried, now, realm)
++		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
+ 	}
+ 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿
+ 	// 根本进不了短名单决策，低 credits 但久置的账号会永远排不进 top5。
+@@ -229,7 +236,15 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+ // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
+ // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
+ // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
+-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
++//
++// reqModel 参与两条**模型级**排除（此前本兜底完全不看模型，导致两处泄漏）：
++//  1. SG 积分闸门（gate.go）：被摘除的账号在兜底里同样不得被选中——否则 normal
++//     阶段被正确摘掉的号会在"全池冷却"时从兜底路径漏回去打付费模型，闸门形同虚设。
++//  2. 6004 模型级冷却（modelCooled）：账号对该模型仍在限额内时不该被兜底选中。
++//     这是既有实现的固有漏洞（normal 走 healthyForModel，兜底只判账号级 until）：
++//     被 6004 限额的号账号级仍健康，一旦其余号都在冷却，兜底就会把它选出来再撞一次 429。
++//     两条都是"有 reqModel 时才生效"，空模型（老 Pick 语义）行为逐字不变。
++func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, reqModel string) *auth.Auth {
+ 	var best *entry
+ 	for uid, e := range p.byUID {
+ 		if tried != nil && tried[uid] {
+@@ -241,6 +256,12 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
+ 		if e.disabled || e.manualDisabled {
+ 			continue // 禁用/手动停用的账号永不参与兜底
+ 		}
++		if !p.sgAllowed(e, reqModel) {
++			continue // SG 闸门：被摘除的号不参与本模型的兜底
++		}
++		if e.modelCooled(now, reqModel) {
++			continue // 6004/11102 模型级冷却：该模型对此号仍不可用
++		}
+ 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
+ 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+ 		}
+diff --git a/internal/pool/pool.go b/internal/pool/pool.go
+index b6e191e..80aa039 100644
+--- a/internal/pool/pool.go
++++ b/internal/pool/pool.go
+@@ -37,6 +37,14 @@ type Pool struct {
+ 	exploreLast map[string]time.Time
+ 	// costExploreEvents 累计探索事件数（/status 透出；pick 写锁内 ++，无需 atomic）。
+ 	costExploreEvents int64
++	// sgGateModel / sgMinCredits / sgResumeCredits / sgGateRealm 付费模型积分闸门
++	// （SetSGGate 注入，见 gate.go）。sgGateModel=="" 或 sgMinCredits<=0 = 关闭。
++	// 语义：闸门 realm 内的账号，余额跌破 sgMinCredits 即从**该模型**的候选集摘除
++	// （entry.sgGated），回到 sgResumeCredits 以上才恢复；其余模型完全不受影响。
++	sgGateModel     string
++	sgMinCredits    int64
++	sgResumeCredits int64
++	sgGateRealm     string
+ 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
+ 	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
+ 	degradeThreshold   int
+diff --git a/internal/pool/realm.go b/internal/pool/realm.go
+index 3885a8d..025fda9 100644
+--- a/internal/pool/realm.go
++++ b/internal/pool/realm.go
+@@ -26,7 +26,11 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
+ 
+ // AvailableUIDsForModelRealm 同 AvailableUIDsForModel，但仅返回 Realm()==realm 的账号
+ // （6004 模型豁免照常生效）。realm=="" 退化为 AvailableUIDsForModel。
++// 叠加 SG 积分闸门（gate.go）：闸门模型下被摘除的账号不列入可用集合——否则会话
++// 粘性路由会把它当成"可用"分配出去，绕过 pick 里的闸门。
+ func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
+ 	return p.availableUIDsLocked(realm,
+-		func(e *entry, now time.Time) bool { return e.healthyForModel(now, model) })
++		func(e *entry, now time.Time) bool {
++			return p.sgAllowed(e, model) && e.healthyForModel(now, model)
++		})
+ }
+diff --git a/internal/pool/state.go b/internal/pool/state.go
+index 0f25737..26266f0 100644
+--- a/internal/pool/state.go
++++ b/internal/pool/state.go
+@@ -339,6 +339,10 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
+ 	if !e.healthyForModel(now, model) {
+ 		return nil
+ 	}
++	// SG 积分闸门：粘性命中同样不得绕过——否则被摘除的号会被绑定会话持续打付费模型。
++	if !p.sgAllowed(e, model) {
++		return nil
++	}
+ 	if p.inFlightFull(e) {
+ 		return nil
+ 	}
+@@ -489,6 +493,10 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
+ 		DegradeUntil:      e.degradeUntil,
+ 		Until:             e.until,
+ 		SoftStreak:        e.softStreak,
++		// SG 闸门位与"余额是否权威"透出（gate.go）：面板据此区分"被闸门摘除"
++		// 与"账号级冷却"——闸门刻意不写 cooling 字段，不另开字段就完全不可见。
++		SGGated:      e.sgGated,
++		CreditsKnown: e.creditsKnown,
+ 		InFlight:          int(e.inFlight.Load()),
+ 		BreakerFails:      e.fails,
+ 		BreakerUntil:      e.breakerUntil,
+diff --git a/internal/scheduler/activity_test.go b/internal/scheduler/activity_test.go
+index e5392a5..333972f 100644
+--- a/internal/scheduler/activity_test.go
++++ b/internal/scheduler/activity_test.go
+@@ -488,10 +488,11 @@ func TestRunCheckinDoesNotTriggerTravel(t *testing.T) {
+ // TestNextWakeTravelIndependent 旅行有独立时点，与签到互不影响。
+ func TestNextWakeTravelIndependent(t *testing.T) {
+ 	s := New(Config{
+-		CheckinHours:   []int{21},
+-		TravelHours:    []int{9},
+-		ActivityHours:  []int{10},
+-		KeepaliveHours: []int{22},
++		CheckinHours:    []int{21},
++		TravelHours:     []int{9},
++		ActivityHours:   []int{10},
++		KeepaliveHours:  []int{22},
++		BillingDisabled: true,
+ 	})
+ 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 8, 0, 0, 0, time.Local))
+ 	if want := time.Date(2026, 9, 11, 9, 0, 0, 0, time.Local); !at.Equal(want) {
+@@ -505,10 +506,11 @@ func TestNextWakeTravelIndependent(t *testing.T) {
+ // TestNextWakeActivityIndependent 活跃上报有独立时点。
+ func TestNextWakeActivityIndependent(t *testing.T) {
+ 	s := New(Config{
+-		CheckinHours:   []int{21},
+-		TravelHours:    []int{9},
+-		ActivityHours:  []int{10},
+-		KeepaliveHours: []int{22},
++		CheckinHours:    []int{21},
++		TravelHours:     []int{9},
++		ActivityHours:   []int{10},
++		KeepaliveHours:  []int{22},
++		BillingDisabled: true,
+ 	})
+ 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 9, 30, 0, 0, time.Local))
+ 	if want := time.Date(2026, 9, 11, 10, 0, 0, 0, time.Local); !at.Equal(want) {
+@@ -522,10 +524,11 @@ func TestNextWakeActivityIndependent(t *testing.T) {
+ // TestNextWakeTravelDisabled 旅行禁用后排程里不再有旅行时点（签到照常）。
+ func TestNextWakeTravelDisabled(t *testing.T) {
+ 	s := New(Config{
+-		CheckinHours:   []int{9, 21},
+-		TravelHours:    []int{9},
+-		TravelDisabled: true,
+-		KeepaliveHours: []int{22},
++		CheckinHours:    []int{9, 21},
++		TravelHours:     []int{9},
++		TravelDisabled:  true,
++		KeepaliveHours:  []int{22},
++		BillingDisabled: true,
+ 	})
+ 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 8, 0, 0, 0, time.Local))
+ 	// 旅行禁用 → 09:00 旅行时点不应出现，最近的是 09:00 签到（同小时但签到未禁用）。
+@@ -549,6 +552,7 @@ func TestNextWakeActivityDisabled(t *testing.T) {
+ 		KeepaliveHours:   []int{22},
+ 		SchoolDisabled:   true,
+ 		CatDisabled:      true,
++		BillingDisabled:  true,
+ 	})
+ 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 9, 30, 0, 0, time.Local))
+ 	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, time.Local); !at.Equal(want) {
+@@ -567,6 +571,7 @@ func TestCheckinDisabledTravelStillRuns(t *testing.T) {
+ 		TravelHours:     []int{9},
+ 		ActivityHours:   []int{10},
+ 		KeepaliveHours:  []int{22},
++		BillingDisabled: true,
+ 	})
+ 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 8, 0, 0, 0, time.Local))
+ 	if want := time.Date(2026, 9, 11, 9, 0, 0, 0, time.Local); !at.Equal(want) {
+@@ -589,6 +594,7 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
+ 		KeepaliveDisabled: true,
+ 		SchoolDisabled:    true,
+ 		CatDisabled:       true,
++		BillingDisabled:   true,
+ 		CheckinHours:      []int{9, 21},
+ 		TravelHours:       []int{9},
+ 		ActivityHours:     []int{10},
+@@ -603,10 +609,11 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
+ // TestNextWakeSameHourTravelAndCheckin 旅行与签到配到同一小时时两类任务都要执行。
+ func TestNextWakeSameHourTravelAndCheckin(t *testing.T) {
+ 	s := New(Config{
+-		CheckinHours:   []int{9, 21},
+-		TravelHours:    []int{9},
+-		ActivityHours:  []int{10},
+-		KeepaliveHours: []int{22},
++		CheckinHours:    []int{9, 21},
++		TravelHours:     []int{9},
++		ActivityHours:   []int{10},
++		KeepaliveHours:  []int{22},
++		BillingDisabled: true,
+ 	})
+ 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 8, 0, 0, 0, time.Local))
+ 	if want := time.Date(2026, 9, 11, 9, 0, 0, 0, time.Local); !at.Equal(want) {
+diff --git a/internal/scheduler/billing.go b/internal/scheduler/billing.go
+new file mode 100644
+index 0000000..909006f
+--- /dev/null
++++ b/internal/scheduler/billing.go
+@@ -0,0 +1,90 @@
++// billing.go 积分轮询排程：周期性对全池账号做一次权威余额核查
++// （upstream.UserResourceDetailed → pool.SetCreditsDetailed）。
++//
++// 为什么必须存在（本 patch 的另一半）：global 账号**不签到**——scheduler.CheckinAll
++// 对 IsGlobal() 直接 skip（国际版无签到体系），于是 SetCreditsDetailed 这条唯一
++// 的权威余额写入路径对 global 从不触发。结果是 global 账号的 entry.credits 只会被
++// NoteModelCost 的扣减路径单调压低，最终长期停在 0：它既不代表真实余额，也无法
++// 驱动任何基于余额的决策（SG 积分闸门正是依赖它）。
++//
++// 本排程把「余额核查」从签到里剥离成独立任务：CN 与 global 一视同仁（CN 账号多跑
++// 一次无副作用——写的是同一个权威值），默认每 30 分钟一轮（Config.BillingInterval）。
++//
++// 间隔即闸门的最坏漏检窗口：SG 闸门只能拦住"已知余额不足"的号，拦不住两次核查之间
++// 被打穿的号。故间隔与闸门阈值（pool.sg_gate.min_credits / resume_credits）是一对参数，
++// 调一个要看另一个。
++//
++// 与签到的分工：签到 = 打卡 + 顺带查余额（CN only）；billing = 只查余额（全域）。
++// 两者都写 SetCreditsDetailed，幂等，谁先到谁生效（同一上游事实来源）。
++package scheduler
++
++import (
++	"context"
++	"log"
++
++	"workbuddy2api/internal/logfmt"
++)
++
++// billingAccountDelay 账号间限速：与活跃上报同口径（800ms），避免一轮核查对
++// 上游形成秒级连发。测试可置 0。
++var billingAccountDelay = activityAccountDelay
++
++// RunBillingNow 立即对全池账号执行一次余额核查（定时入口 + 手动触发 + 测试）。
++// 无 ctx 的外部入口走背景 ctx（语义同 RunActivityNow）。
++func (s *Scheduler) RunBillingNow() {
++	s.runBilling(context.Background())
++}
++
++// runBilling 余额核查遍历，随 ctx 取消立即退出。
++//
++// 遍历口径：
++//   - disabled 账号跳过（凭证可能已死，核查只会白刷 WARN）；
++//   - 无凭证（无 UID/无 token）跳过；
++//   - **不跳过 cooling 账号**——这正是核查的价值所在：CoolHard（余额耗尽）的号
++//     要靠它确认"钱回来了"从而提前解冻（ClearCreditCooldownIfRecovered）；
++//   - 单账号失败只记 WARN，不影响其余账号（与 checkin/activity 同口径）。
++//
++// 每次核查做三件事：
++//  1. SetCreditsDetailed：写权威余额 + 快过架子集（同时驱动 SG 闸门重算）；
++//  2. ClearCreditCooldownIfRecovered：余额 > 0 且正处 CoolHard → 定向解冻
++//     （只解"没钱"这一种冷却，不碰 429/6004，避免解冻即撞限流的循环）；
++//  3. 逐号结果日志（成功一行带余额，失败一行带原因）。
++func (s *Scheduler) runBilling(ctx context.Context) {
++	statuses := s.cfg.Pool.List()
++	var okN, failN, skipN, revivedN int
++	first := true
++	for _, st := range statuses {
++		if st.Disabled {
++			skipN++
++			continue
++		}
++		a := s.cfg.Pool.AuthByUID(st.UID)
++		if a == nil || a.AccessTokenValue() == "" {
++			skipN++
++			continue
++		}
++		if !first {
++			if !sleepCtx(ctx, billingAccountDelay) {
++				log.Printf("billing poll: ctx canceled, %d/%d accounts checked", okN+failN, len(statuses))
++				return // 优雅停机：剩余账号下轮再查
++			}
++		}
++		first = false
++		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
++		if err != nil {
++			// 单号失败不阻断：global 账号的 billing 通道偶发抖动是已知形态，
++			// 下一轮（默认 30m 后）自然重试，不在此重试放大风控面。
++			log.Printf("billing %s: %v", logfmt.Label(st.UID, st.Nickname), err)
++			failN++
++			continue
++		}
++		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
++		if s.cfg.Pool.ClearCreditCooldownIfRecovered(st.UID, remain) {
++			revivedN++
++		}
++		log.Printf("billing %s: credits=%d expiring=%d", logfmt.Label(st.UID, st.Nickname), remain, buckets.Expiring)
++		okN++
++	}
++	log.Printf("billing done: total=%d ok=%d fail=%d skipped=%d revived=%d",
++		len(statuses), okN, failN, skipN, revivedN)
++}
+diff --git a/internal/scheduler/billing_test.go b/internal/scheduler/billing_test.go
+new file mode 100644
+index 0000000..cd810dc
+--- /dev/null
++++ b/internal/scheduler/billing_test.go
+@@ -0,0 +1,297 @@
++// billing_test.go 积分轮询排程（patch 0002）测试：
++// global 账号余额刷新、CoolHard 定向解冻、失败不阻断、ctx 取消快速退出。
++package scheduler
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/pool"
++	"workbuddy2api/internal/upstream"
++)
++
++// TestRunBillingRefreshesGlobalCredits 核心验收：global 账号（不签到，credits 曾是
++// 终身冻结的死数字）经 billing 轮询后拿到权威余额，并驱动 SG 闸门出闸。
++func TestRunBillingRefreshesGlobalCredits(t *testing.T) {
++	old := billingAccountDelay
++	billingAccountDelay = 0
++	t.Cleanup(func() { billingAccountDelay = old })
++
++	auth.SetGlobalEnabled(true)
++	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
++
++	f := &fakeUpstream{resourceRemain: 500}
++	srv := f.server()
++	defer srv.Close()
++
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	p.SetSGGate(true, "sg-model", 20, 100, "global")
++	// 轮询前：余额未知 → 保守进闸（打不了付费模型）。
++	if a := p.PickByUIDForModel("g1", "sg-model"); a != nil {
++		t.Fatal("轮询前余额未知的 global 号不应可选付费模型")
++	}
++
++	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
++	s := New(Config{Pool: p, Upstream: up})
++	s.RunBillingNow()
++
++	st, _ := p.Status("g1")
++	if !st.CreditsKnown {
++		t.Errorf("billing 轮询后 credits_known 应为 true: %+v", st)
++	}
++	if st.Credits != 500 {
++		t.Errorf("credits=%d want 500（权威余额未写入）", st.Credits)
++	}
++	if st.SGGated {
++		t.Errorf("余额 500 >= resume 100，应已出闸: %+v", st)
++	}
++	if a := p.PickByUIDForModel("g1", "sg-model"); a == nil {
++		t.Error("余额充足后应恢复付费模型可用")
++	}
++}
++
++// TestRunBillingRevivesHardCreditCooldown billing 核查发现余额恢复 → 定向解冻 CoolHard。
++func TestRunBillingRevivesHardCreditCooldown(t *testing.T) {
++	old := billingAccountDelay
++	billingAccountDelay = 0
++	t.Cleanup(func() { billingAccountDelay = old })
++
++	f := &fakeUpstream{resourceRemain: 300}
++	srv := f.server()
++	defer srv.Close()
++
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	p.Cooldown("u1", pool.CoolHard, 12*time.Hour, "余额不足")
++
++	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
++	s := New(Config{Pool: p, Upstream: up})
++	s.RunBillingNow()
++
++	st, _ := p.Status("u1")
++	if st.Cooling {
++		t.Errorf("余额恢复后 CoolHard 应被定向解冻: %+v", st)
++	}
++}
++
++// TestRunBillingSoftCooldownUntouched billing 核查**不得**解冻软冷却（429）：
++// 否则会形成「轮询一次解冻一次、再撞一次 429」的循环。
++func TestRunBillingSoftCooldownUntouched(t *testing.T) {
++	old := billingAccountDelay
++	billingAccountDelay = 0
++	t.Cleanup(func() { billingAccountDelay = old })
++
++	f := &fakeUpstream{resourceRemain: 300}
++	srv := f.server()
++	defer srv.Close()
++
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	p.CooldownSoftRate("u1", time.Hour, time.Time{}, "429 rate limit")
++
++	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
++	s := New(Config{Pool: p, Upstream: up})
++	s.RunBillingNow()
++
++	st, _ := p.Status("u1")
++	if !st.Cooling {
++		t.Errorf("软冷却不应被 billing 核查解冻: %+v", st)
++	}
++}
++
++// TestRunBillingSingleFailureDoesNotAbort 单号失败不阻断其余账号。
++func TestRunBillingSingleFailureDoesNotAbort(t *testing.T) {
++	old := billingAccountDelay
++	billingAccountDelay = 0
++	t.Cleanup(func() { billingAccountDelay = old })
++
++	var calls atomic.Int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if !strings.HasSuffix(r.URL.Path, "/get-user-resource") {
++			http.Error(w, "not found", 404)
++			return
++		}
++		n := calls.Add(1)
++		if n == 1 {
++			http.Error(w, "boom", 500) // 第一个号失败
++			return
++		}
++		w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":1000,"CycleCapacityRemain":700,"CycleCapacityUsed":0}]}}}}`))
++	}))
++	defer srv.Close()
++
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++
++	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
++	s := New(Config{Pool: p, Upstream: up})
++	s.RunBillingNow()
++
++	// 两个号都发起了请求（u1 失败不阻断 u2），且 u2 的余额落库。
++	if calls.Load() != 2 {
++		t.Errorf("upstream calls=%d want 2（单号失败不应阻断遍历）", calls.Load())
++	}
++	if st, _ := p.Status("u2"); st.Credits != 700 {
++		t.Errorf("u2 credits=%d want 700", st.Credits)
++	}
++}
++
++// TestRunBillingSkipsDisabled 禁用账号跳过（凭证可能已死，核查只会白刷 WARN）。
++func TestRunBillingSkipsDisabled(t *testing.T) {
++	old := billingAccountDelay
++	billingAccountDelay = 0
++	t.Cleanup(func() { billingAccountDelay = old })
++
++	f := &fakeUpstream{resourceRemain: 500}
++	srv := f.server()
++	defer srv.Close()
++
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	p.Disable("u1", "12153 session dead")
++
++	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
++	s := New(Config{Pool: p, Upstream: up})
++	s.RunBillingNow()
++
++	if st, _ := p.Status("u1"); st.Credits != 0 {
++		t.Errorf("禁用账号不应被核查（credits=%d）", st.Credits)
++	}
++}
++
++// TestRunBillingCtxCancel billing 遍历随 ctx 取消立即退出（不睡满剩余账号的限速）。
++func TestRunBillingCtxCancel(t *testing.T) {
++	old := billingAccountDelay
++	billingAccountDelay = 30 * time.Second // 人为放大：取消后不应等它睡满
++	t.Cleanup(func() { billingAccountDelay = old })
++
++	f := &fakeUpstream{resourceRemain: 500}
++	srv := f.server()
++	defer srv.Close()
++
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	p.Add(&auth.Auth{UID: "u3", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++
++	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
++	s := New(Config{Pool: p, Upstream: up})
++
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan struct{})
++	go func() { s.runBilling(ctx); close(done) }()
++
++	time.Sleep(100 * time.Millisecond) // 让第一个账号查完，进入账号间限速
++	cancel()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("ctx 取消后 runBilling 未及时退出（限速睡眠未被打断）")
++	}
++}
++
++// TestBillingScheduledByDefault 默认排程含 billing，且是**固定 30m 间隔**
++// （槽位落在 :00/:30，而非整点小时表）。
++func TestBillingScheduledByDefault(t *testing.T) {
++	s := New(Config{CheckinHours: []int{9, 21}})
++	if s.cfg.BillingInterval != 30*time.Minute {
++		t.Fatalf("BillingInterval=%v want 30m（缺省应被 New 填充）", s.cfg.BillingInterval)
++	}
++	if s.cfg.BillingDisabled {
++		t.Fatal("billing 缺省应启用")
++	}
++	// 00:30 起算：最近槽位是 01:00（cat 也在这一时刻，两者同刻合批）。
++	at, kinds := s.nextWake(time.Date(2026, 9, 11, 0, 30, 0, 0, time.Local))
++	if want := time.Date(2026, 9, 11, 1, 0, 0, 0, time.Local); !at.Equal(want) {
++		t.Fatalf("next=%v want %v", at, want)
++	}
++	if !hasKind(kinds, taskBilling) {
++		t.Errorf("kinds=%v 01:00 应含 billing（30m 间隔的整点槽位）", kinds)
++	}
++	// 00:45 起算：最近的 billing 槽位是 01:00，cat 在 01:00，仍是同刻。
++	// 关键在于 01:30 这个**非整点**槽位也要被排到——这是固定间隔与整点小时表的差别。
++	at, kinds = s.nextWake(time.Date(2026, 9, 11, 1, 5, 0, 0, time.Local))
++	if want := time.Date(2026, 9, 11, 1, 30, 0, 0, time.Local); !at.Equal(want) {
++		t.Fatalf("next=%v want %v（30m 间隔的半整点槽位）", at, want)
++	}
++	if !hasKind(kinds, taskBilling) {
++		t.Errorf("kinds=%v 01:30 应含 billing", kinds)
++	}
++}
++
++// TestBillingIntervalConfigurable 间隔可配（如 15m），槽位随之变密；
++// 低于下限时钳到下限（避免对上游高频连发）。
++func TestBillingIntervalConfigurable(t *testing.T) {
++	s := New(Config{BillingInterval: 15 * time.Minute})
++	if got := s.billingMinutes(); len(got) != 96 {
++		t.Fatalf("15m 间隔应铺 96 个槽位，got %d", len(got))
++	}
++	at, kinds := s.nextWake(time.Date(2026, 9, 11, 1, 5, 0, 0, time.Local))
++	if want := time.Date(2026, 9, 11, 1, 15, 0, 0, time.Local); !at.Equal(want) {
++		t.Fatalf("next=%v want %v", at, want)
++	}
++	if !hasKind(kinds, taskBilling) {
++		t.Errorf("kinds=%v 应含 billing", kinds)
++	}
++
++	// 配到下限之下（1m）→ 钳到下限 10m。
++	s2 := New(Config{BillingInterval: time.Minute})
++	if s2.cfg.BillingInterval != defaultBillingMinInterval {
++		t.Fatalf("1m 应被钳到 %v，got %v", defaultBillingMinInterval, s2.cfg.BillingInterval)
++	}
++	if got := s2.billingMinutes(); len(got) != 144 {
++		t.Fatalf("10m 间隔应铺 144 个槽位，got %d", len(got))
++	}
++}
++
++// TestBillingDisabledNoSlots 关闭 billing 后不产生任何槽位，
++// 且 dueSlots 不再枚举它（否则补跑路径会把关掉的任务跑起来）。
++func TestBillingDisabledNoSlots(t *testing.T) {
++	s := New(Config{BillingDisabled: true})
++	if got := s.billingMinutes(); got != nil {
++		t.Fatalf("billing 关闭时不应有槽位，got %v", got)
++	}
++	for _, d := range s.dueSlots(time.Date(2026, 9, 11, 0, 0, 0, 0, time.Local),
++		time.Date(2026, 9, 11, 23, 59, 0, 0, time.Local)) {
++		if hasKind(d.kinds, taskBilling) {
++			t.Fatalf("billing 已关闭，补跑槽位不应含它: %v", d)
++		}
++	}
++}
++
++// TestBillingDueSlotsCatchUp 睡过一段时间后，跨过的 billing 槽位按时间顺序补跑
++// （30m 间隔下睡眠 2 小时应补 4 个槽位）。
++func TestBillingDueSlotsCatchUp(t *testing.T) {
++	s := New(Config{
++		CheckinDisabled: true, TravelDisabled: true, ActivityDisabled: true,
++		KeepaliveDisabled: true, SchoolDisabled: true, CatDisabled: true,
++	})
++	got := s.dueSlots(
++		time.Date(2026, 9, 11, 10, 0, 0, 0, time.Local),
++		time.Date(2026, 9, 11, 12, 0, 0, 0, time.Local))
++	want := []time.Time{
++		time.Date(2026, 9, 11, 10, 30, 0, 0, time.Local),
++		time.Date(2026, 9, 11, 11, 0, 0, 0, time.Local),
++		time.Date(2026, 9, 11, 11, 30, 0, 0, time.Local),
++		time.Date(2026, 9, 11, 12, 0, 0, 0, time.Local),
++	}
++	if len(got) != len(want) {
++		t.Fatalf("补跑槽位数=%d want %d: %v", len(got), len(want), got)
++	}
++	for i, d := range got {
++		if !d.planned.Equal(want[i]) {
++			t.Errorf("槽位[%d]=%v want %v", i, d.planned, want[i])
++		}
++		if !hasKind(d.kinds, taskBilling) {
++			t.Errorf("槽位[%d] 应含 billing: %v", i, d.kinds)
++		}
++	}
++}
+diff --git a/internal/scheduler/scheduler.go b/internal/scheduler/scheduler.go
+index 34b4ede..f76bebc 100644
+--- a/internal/scheduler/scheduler.go
++++ b/internal/scheduler/scheduler.go
+@@ -1,5 +1,10 @@
+-// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子 六类独立排程。
++// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 /
++// 夜猫子 / 积分轮询（billing，patch 0002）七类独立排程。
+ // 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻。
++//
++// 积分轮询为何独立成第七类：realm=global 的账号没有签到体系（CheckinAll 直接跳过），
++// 因此它们的 credits 只会被 NoteModelCost 单调扣减、永不刷新，是"死数字"——SG 闸门
++// 拿它当判据会把好号误摘。billing 轮询是 global 账号余额的唯一权威来源。
+ package scheduler
+ 
+ import (
+@@ -19,8 +24,8 @@ import (
+ 
+ // Config 调度器依赖。
+ //
+-// 任务开关用「禁用」命名而非「启用」：零值 Config 即六类任务都启用（hours 回落默认），
+-// 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
++// 任务开关用「禁用」命名而非「启用」：零值 Config 即七类任务都启用（hours/interval
++// 回落默认），与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
+ type Config struct {
+ 	Pool           *pool.Pool
+ 	Upstream       *upstream.Client
+@@ -52,6 +57,19 @@ type Config struct {
+ 	SchoolDisabled bool
+ 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
+ 	CatDisabled bool
++
++	// BillingInterval 积分轮询间隔（patch 0002），默认 30m。<=0 回落默认；
++	// 低于 BillingMinInterval 钳到下限并打 WARN（避免对上游高频连发触发风控）。
++	// 为什么是「间隔」而不是像其余六类那样的整点小时表：轮询槽位必须能落在半点
++	// （:30）上，整点表表达不了（见 fixedIntervalSlots）。
++	BillingInterval time.Duration
++	// BillingMinInterval 轮询间隔下限，默认 10m。<=0 回落默认。
++	// 轮询越密，对上游 /get-user-resource 的调用越密，风控暴露面随之线性上升；
++	// 下限是"配错了也打不到上游脸上"的护栏，触发时打 WARN 而非静默钳。
++	BillingMinInterval time.Duration
++	// BillingDisabled 显式关闭积分轮询排程（schedule.billing_enabled=false）。
++	// 关闭后 global 账号余额不再刷新，SG 闸门失去判据（只剩最后一次已知值）。
++	BillingDisabled bool
+ }
+ 
+ // Scheduler 调度器。
+@@ -97,6 +115,18 @@ func New(cfg Config) *Scheduler {
+ 	if cfg.ActivityReportCount <= 0 {
+ 		cfg.ActivityReportCount = 1
+ 	}
++	if cfg.BillingMinInterval <= 0 {
++		cfg.BillingMinInterval = defaultBillingMinInterval
++	}
++	if cfg.BillingInterval <= 0 {
++		cfg.BillingInterval = defaultBillingInterval
++	}
++	// 低于下限不静默钳：打 WARN 说明"配小了、已按下限跑"，避免运维以为配置生效。
++	if cfg.BillingInterval < cfg.BillingMinInterval {
++		log.Printf("WARN: schedule.billing_interval=%s 低于下限 %s，已钳到下限（避免对上游高频连发）",
++			cfg.BillingInterval, cfg.BillingMinInterval)
++		cfg.BillingInterval = cfg.BillingMinInterval
++	}
+ 	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string), rewardClaimed: make(map[string]string)}
+ }
+ 
+@@ -141,6 +171,56 @@ func nextFire(now time.Time, hours []int) time.Time {
+ 	return earliest
+ }
+ 
++// 积分轮询默认参数（patch 0002）。
++//
++// 30m 这个间隔不是随手取的：SG 闸门只能摘掉"余额已知不足"的号，摘不掉"两次核查
++// 之间被打空"的号——**轮询间隔就是闸门的最坏漏检窗口**。默认 30m 配 min_credits=50
++// 留出两次核查间的余量（-sg 实测约 0.0014~0.0057 credits/1k tokens，50 够跑很多轮）。
++// 下限 10m 是护栏：轮询越密，对上游的调用越密，风控暴露面线性上升。
++const (
++	defaultBillingInterval    = 30 * time.Minute
++	defaultBillingMinInterval = 10 * time.Minute
++)
++
++// fixedIntervalSlots 把「固定间隔」展开成日内分钟表（0-1439，升序）。
++//
++// 为什么要展开成分钟表而不是直接算 next = now.Truncate(interval)+interval：
++// 排程的身份必须是**墙钟槽位**（:00/:30/:15...）而不是"距上次唤醒过了多久"。
++// 否则机器睡一觉醒来，nextWake 与 dueSlots 会算出不同的槽位，补跑路径就会
++// 要么漏跑要么重复跑。展开成与 hours 同构的静态表后，两条路径天然一致。
++//
++// interval <= 0 或 > 24h 返回 nil（无槽位 = 不排程；24h 整除性无意义）。
++func fixedIntervalSlots(interval time.Duration) []int {
++	if interval <= 0 || interval > 24*time.Hour {
++		return nil
++	}
++	n := int((24 * time.Hour) / interval)
++	out := make([]int, 0, n)
++	dayStart := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
++	for i := 0; i < n; i++ {
++		t := dayStart.Add(time.Duration(i) * interval)
++		out = append(out, t.Hour()*60+t.Minute())
++	}
++	return out
++}
++
++// nextMinuteSlot 返回 now 之后最近的一个日内分钟表槽位：今天剩下的取最小，
++// 今天的都过了就取明天的第一个（minutes 需升序且非空）。
++//
++// 用 time.Date 逐字段构造而非 day.Add(...)：必须与 dueSlots 的构造方式逐字一致，
++// 否则夏令时切换日两条路径会算出不同的时刻，补跑判定随即错位。
++func nextMinuteSlot(now time.Time, minutes []int) time.Time {
++	loc := now.Location()
++	for _, m := range minutes {
++		t := time.Date(now.Year(), now.Month(), now.Day(), m/60, m%60, 0, 0, loc)
++		if t.After(now) {
++			return t
++		}
++	}
++	return time.Date(now.Year(), now.Month(), now.Day(), minutes[0]/60, minutes[0]%60, 0, 0, loc).
++		AddDate(0, 0, 1)
++}
++
+ // taskKind 调度任务类型。
+ type taskKind int
+ 
+@@ -150,23 +230,36 @@ type slot struct {
+ 	kind taskKind
+ }
+ 
+-// schedule 一类任务的排程：小时表 + 该类的启用位。
++// schedule 一类任务的排程：小时表（或日内分钟表）+ 该类的启用位。
++//
++// minutes 非空时优先于 hours：积分轮询用固定间隔排程，槽位要落在半点上，
++// 整点小时表表达不了，故另开一张日内分钟表。其余六类恒走 hours。
+ type schedule struct {
+ 	hours    []int
+ 	kind     taskKind
+ 	disabled bool
++	minutes  []int // 日内分钟表（0-1439）；非空时优先于 hours
+ }
+ 
+-// schedules 六类任务的排程表（顺序即 kinds 的稳定顺序）。
++// schedules 七类任务的排程表（顺序即 kinds 的稳定顺序）。
+ func (s *Scheduler) schedules() []schedule {
+ 	return []schedule{
+-		{s.cfg.CheckinHours, taskCheckin, s.cfg.CheckinDisabled},
+-		{s.cfg.TravelHours, taskTravel, s.cfg.TravelDisabled},
+-		{s.cfg.ActivityHours, taskActivity, s.cfg.ActivityDisabled},
+-		{s.cfg.KeepaliveHours, taskKeepalive, s.cfg.KeepaliveDisabled},
+-		{s.cfg.SchoolHours, taskSchool, s.cfg.SchoolDisabled},
+-		{s.cfg.CatHours, taskCat, s.cfg.CatDisabled},
++		{s.cfg.CheckinHours, taskCheckin, s.cfg.CheckinDisabled, nil},
++		{s.cfg.TravelHours, taskTravel, s.cfg.TravelDisabled, nil},
++		{s.cfg.ActivityHours, taskActivity, s.cfg.ActivityDisabled, nil},
++		{s.cfg.KeepaliveHours, taskKeepalive, s.cfg.KeepaliveDisabled, nil},
++		{s.cfg.SchoolHours, taskSchool, s.cfg.SchoolDisabled, nil},
++		{s.cfg.CatHours, taskCat, s.cfg.CatDisabled, nil},
++		{nil, taskBilling, s.cfg.BillingDisabled, s.billingMinutes()},
++	}
++}
++
++// billingMinutes 积分轮询的日内分钟表；关闭或无有效间隔时返回 nil（不排程）。
++func (s *Scheduler) billingMinutes() []int {
++	if s.cfg.BillingDisabled || s.cfg.BillingInterval <= 0 {
++		return nil
+ 	}
++	return fixedIntervalSlots(s.cfg.BillingInterval)
+ }
+ 
+ const (
+@@ -176,6 +269,7 @@ const (
+ 	taskKeepalive
+ 	taskSchool
+ 	taskCat
++	taskBilling
+ )
+ 
+ // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
+@@ -187,6 +281,10 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
+ 		if sch.disabled {
+ 			continue
+ 		}
++		if len(sch.minutes) > 0 {
++			slots = append(slots, slot{nextMinuteSlot(now, sch.minutes), sch.kind})
++			continue
++		}
+ 		slots = append(slots, slot{nextFire(now, sch.hours), sch.kind})
+ 	}
+ 	var earliest time.Time
+@@ -295,6 +393,16 @@ func (s *Scheduler) dueSlots(cursor, now time.Time) []dueSlot {
+ 			if sch.disabled {
+ 				continue
+ 			}
++			if len(sch.minutes) > 0 {
++				for _, m := range sch.minutes {
++					t := time.Date(day.Year(), day.Month(), day.Day(), m/60, m%60, 0, 0, loc)
++					if !t.After(start) || t.After(now) {
++						continue
++					}
++					out = append(out, dueSlot{planned: t, kinds: []taskKind{sch.kind}})
++				}
++				continue
++			}
+ 			for _, h := range sch.hours {
+ 				t := time.Date(day.Year(), day.Month(), day.Day(), h, 0, 0, 0, loc)
+ 				if !t.After(start) || t.After(now) {
+@@ -341,7 +449,7 @@ func (s *Scheduler) Run(ctx context.Context) {
+ 		// ② 再等下一个槽位：分段小睡、每段重新对墙钟（睡眠跨过槽位也能按时发现）。
+ 		next, kinds := s.nextWake(cursor)
+ 		if next.IsZero() {
+-			// 六类任务全部禁用：不空转，只等退出信号。
++			// 七类任务全部禁用：不空转，只等退出信号。
+ 			<-ctx.Done()
+ 			return
+ 		}
+@@ -399,6 +507,8 @@ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
+ 		s.RunSchoolNow()
+ 	case taskCat:
+ 		s.RunCatNow()
++	case taskBilling:
++		s.RunBillingNow()
+ 	}
+ }
+ 
+diff --git a/internal/scheduler/scheduler_test.go b/internal/scheduler/scheduler_test.go
+index 7b4211b..1ebdf37 100644
+--- a/internal/scheduler/scheduler_test.go
++++ b/internal/scheduler/scheduler_test.go
+@@ -48,7 +48,7 @@ func TestNextFireMergesSchedules(t *testing.T) {
+ // TestNextWakeKeepaliveOnly 签到已过点时按保活整点唤醒。
+ func TestNextWakeKeepaliveOnly(t *testing.T) {
+ 	s := New(Config{CheckinHours: []int{9}, KeepaliveHours: []int{22},
+-		TravelDisabled: true, ActivityDisabled: true})
++		TravelDisabled: true, ActivityDisabled: true, BillingDisabled: true})
+ 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
+ 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
+ 		t.Errorf("next=%v want %v", at, want)
+@@ -69,6 +69,7 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
+ 		ActivityDisabled: true,
+ 		SchoolDisabled:   true,
+ 		CatDisabled:      true,
++		BillingDisabled:  true,
+ 	})
+ 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, time.Local))
+ 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
+@@ -100,7 +101,7 @@ func TestNextWakeNothingScheduled(t *testing.T) {
+ // TestNextWakeCheckinDisabled 显式禁用签到后，排程里不再有签到时点（保活照常）。
+ func TestNextWakeCheckinDisabled(t *testing.T) {
+ 	s := New(Config{CheckinDisabled: true, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22},
+-		TravelDisabled: true, ActivityDisabled: true})
++		TravelDisabled: true, ActivityDisabled: true, BillingDisabled: true})
+ 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
+ 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
+ 		t.Errorf("next=%v want %v（不应再有 21 点签到）", at, want)
+@@ -113,7 +114,7 @@ func TestNextWakeCheckinDisabled(t *testing.T) {
+ // TestNextWakeKeepaliveDisabled 显式禁用保活后，排程里不再有保活时点（签到照常）。
+ func TestNextWakeKeepaliveDisabled(t *testing.T) {
+ 	s := New(Config{KeepaliveDisabled: true, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22},
+-		TravelDisabled: true, ActivityDisabled: true})
++		TravelDisabled: true, ActivityDisabled: true, BillingDisabled: true})
+ 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
+ 	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, time.Local); !at.Equal(want) {
+ 		t.Errorf("next=%v want %v（不应再有 22 点保活）", at, want)
+@@ -132,6 +133,7 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
+ 		KeepaliveDisabled: true,
+ 		SchoolDisabled:    true,
+ 		CatDisabled:       true,
++		BillingDisabled:   true,
+ 		CheckinHours:      []int{9, 21},
+ 		KeepaliveHours:    []int{22},
+ 	})
+@@ -167,6 +169,7 @@ func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
+ 		KeepaliveDisabled: true,
+ 		SchoolDisabled:    true,
+ 		CatDisabled:       true,
++		BillingDisabled:   true,
+ 	})
+ 
+ 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+diff --git a/internal/scheduler/school_test.go b/internal/scheduler/school_test.go
+index 96f8fe8..b9d2246 100644
+--- a/internal/scheduler/school_test.go
++++ b/internal/scheduler/school_test.go
+@@ -56,6 +56,7 @@ func TestNextWakeSchoolSlot(t *testing.T) {
+ 		TravelDisabled:    true,
+ 		ActivityDisabled:  true,
+ 		KeepaliveDisabled: true,
++		BillingDisabled:   true,
+ 		SchoolHours:       []int{12},
+ 	})
+ 	at, kinds := s.nextWake(time.Date(2026, 9, 14, 11, 0, 0, 0, time.Local))
+@@ -74,6 +75,7 @@ func TestNextWakeCatSlot(t *testing.T) {
+ 		TravelDisabled:    true,
+ 		ActivityDisabled:  true,
+ 		KeepaliveDisabled: true,
++		BillingDisabled:   true,
+ 		CatHours:          []int{1},
+ 	})
+ 	at, kinds := s.nextWake(time.Date(2026, 9, 14, 23, 0, 0, 0, time.Local))
+@@ -96,6 +98,7 @@ func TestNextWakeSchoolCatDisabled(t *testing.T) {
+ 		CatHours:          []int{1},
+ 		SchoolDisabled:    true,
+ 		CatDisabled:       true,
++		BillingDisabled:   true,
+ 	})
+ 	at, kinds := s.nextWake(time.Date(2026, 9, 14, 8, 0, 0, 0, time.Local))
+ 	if want := time.Date(2026, 9, 14, 21, 0, 0, 0, time.Local); !at.Equal(want) {
+diff --git a/internal/scheduler/wake_test.go b/internal/scheduler/wake_test.go
+index 36b5368..5bc2c65 100644
+--- a/internal/scheduler/wake_test.go
++++ b/internal/scheduler/wake_test.go
+@@ -57,12 +57,13 @@ func TestWaitForSlotContextCancel(t *testing.T) {
+ // 醒来时补上」——修前 Run 从 time.Now() 重算，09:00 会被直接跳过（只能等第二天）。
+ func TestDueSlotsCatchesSlotsCrossedBySleep(t *testing.T) {
+ 	s := New(Config{
+-		CheckinHours:   []int{9},
+-		TravelHours:    []int{9}, // 与签到同刻：验证同刻合并
+-		ActivityHours:  []int{10},
+-		KeepaliveHours: []int{21},
+-		SchoolHours:    []int{12},
+-		CatHours:       []int{1},
++		CheckinHours:    []int{9},
++		TravelHours:     []int{9}, // 与签到同刻：验证同刻合并
++		ActivityHours:   []int{10},
++		KeepaliveHours:  []int{21},
++		SchoolHours:     []int{12},
++		CatHours:        []int{1},
++		BillingDisabled: true,
+ 	})
+ 	cursor := time.Date(2026, 9, 27, 20, 0, 0, 0, time.Local)
+ 	now := time.Date(2026, 9, 28, 9, 5, 0, 0, time.Local)
