@@ -26,7 +26,11 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 
 // AvailableUIDsForModelRealm 同 AvailableUIDsForModel，但仅返回 Realm()==realm 的账号
 // （6004 模型豁免照常生效）。realm=="" 退化为 AvailableUIDsForModel。
+// 叠加 SG 积分闸门（gate.go）：闸门模型下被摘除的账号不列入可用集合——否则会话
+// 粘性路由会把它当成"可用"分配出去，绕过 pick 里的闸门。
 func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 	return p.availableUIDsLocked(realm,
-		func(e *entry, now time.Time) bool { return e.healthyForModel(now, model) })
+		func(e *entry, now time.Time) bool {
+			return p.sgAllowed(e, model) && e.healthyForModel(now, model)
+		})
 }

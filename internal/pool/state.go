@@ -339,6 +339,10 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	if !e.healthyForModel(now, model) {
 		return nil
 	}
+	// SG 积分闸门：粘性命中同样不得绕过——否则被摘除的号会被绑定会话持续打付费模型。
+	if !p.sgAllowed(e, model) {
+		return nil
+	}
 	if p.inFlightFull(e) {
 		return nil
 	}
@@ -489,6 +493,10 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		DegradeUntil:      e.degradeUntil,
 		Until:             e.until,
 		SoftStreak:        e.softStreak,
+		// SG 闸门位与"余额是否权威"透出（gate.go）：面板据此区分"被闸门摘除"
+		// 与"账号级冷却"——闸门刻意不写 cooling 字段，不另开字段就完全不可见。
+		SGGated:      e.sgGated,
+		CreditsKnown: e.creditsKnown,
 		InFlight:          int(e.inFlight.Load()),
 		BreakerFails:      e.fails,
 		BreakerUntil:      e.breakerUntil,

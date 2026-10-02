@@ -6,13 +6,20 @@
 // 两个命令共用同一份定义，消除漂移源头。
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Schedule 排程配置段（对应 config.json 的 "schedule" 对象）。
 //
-// 六类独立排程：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子。
-// cmd/server 与 cmd/activity 共用本结构，默认值由 DefaultSchedule 填充、
-// 缺省归一由 Normalize 完成——两命令走同一份语义，不再各自复制。
+// 七类独立排程：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子 /
+// 积分轮询（billing，patch 0002）。cmd/server 与 cmd/activity 共用本结构，默认值由
+// DefaultSchedule 填充、缺省归一由 Normalize 完成——两命令走同一份语义，不再各自复制。
+//
+// billing 为何用「间隔时长」而不是像其余六类那样的整点小时表：积分轮询的价值在于
+// 把 SG 闸门的最坏漏检窗口压到可接受范围，槽位必须能落在半点（如 :30）上；
+// 整点小时表表达不了 :30，所以单独走 BillingInterval（见 scheduler.fixedIntervalSlots）。
 type Schedule struct {
 	CheckinHours   []int `json:"checkin_hours"`   // [9,21]
 	TravelHours    []int `json:"travel_hours"`    // [9,21]
@@ -35,6 +42,13 @@ type Schedule struct {
 	KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 	SchoolEnabled    bool `json:"school_enabled"`    // 缺省 true；false = 停开学季任务
 	CatEnabled       bool `json:"cat_enabled"`       // 缺省 true；false = 停夜猫子任务
+	// BillingInterval 积分轮询间隔（patch 0002），默认 "30m"。写成时长而非整点
+	// 小时表：轮询槽位要能落在半点上（见类型注释）。下限由 scheduler 钳（默认 10m，
+	// 低于下限打 WARN 后钳到下限）——此处只做解析与空值回落。
+	BillingInterval string `json:"billing_interval"` // "30m"
+	// BillingEnabled 积分轮询开关，缺省 true。false = 完全停轮询：global 账号的
+	// 余额将不再刷新（creditsKnown 停在最后已知值，SG 闸门失去判据）。
+	BillingEnabled bool `json:"billing_enabled"` // 缺省 true；false = 停积分轮询
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int `json:"activity_report_count"`
@@ -61,6 +75,8 @@ func DefaultSchedule() Schedule {
 		KeepaliveEnabled:    true,
 		SchoolEnabled:       true,
 		CatEnabled:          true,
+		BillingInterval:     "30m",
+		BillingEnabled:      true,
 		ActivityReportCount: 5, // 领猫前置需 5 次对话，5 连发刷满 chat_5
 	}
 }
@@ -92,6 +108,10 @@ func (s *Schedule) Normalize() error {
 	if len(s.CatHours) == 0 {
 		s.CatHours = []int{1}
 	}
+	// billing 间隔空值回落默认 30m（键缺席时 DefaultSchedule 已置值，此兜底覆盖显式 ""）。
+	if s.BillingInterval == "" {
+		s.BillingInterval = "30m"
+	}
 	// 0/负数 → 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if s.ActivityReportCount <= 0 {
 		s.ActivityReportCount = 1
@@ -120,7 +140,16 @@ func (s *Schedule) validateHours() error {
 	if err := checkHourRange("schedule.school_hours", "school_enabled", s.SchoolHours); err != nil {
 		return err
 	}
-	return checkHourRange("schedule.cat_hours", "cat_enabled", s.CatHours)
+	if err := checkHourRange("schedule.cat_hours", "cat_enabled", s.CatHours); err != nil {
+		return err
+	}
+	// billing 间隔必须是合法时长（如 "30m"）。这里快速失败而不是静默回落默认：
+	// 轮询间隔直接决定 SG 闸门的最坏漏检窗口，静默回落会让运维以为配的值生效了。
+	// 下限（scheduler.defaultBillingMinInterval）不在这里钳——那里能打 WARN。
+	if _, err := time.ParseDuration(s.BillingInterval); err != nil {
+		return fmt.Errorf("schedule.billing_interval: %q 不是合法时长（如 \"30m\"）: %w", s.BillingInterval, err)
+	}
+	return nil
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {

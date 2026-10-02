@@ -57,12 +57,13 @@ func TestWaitForSlotContextCancel(t *testing.T) {
 // 醒来时补上」——修前 Run 从 time.Now() 重算，09:00 会被直接跳过（只能等第二天）。
 func TestDueSlotsCatchesSlotsCrossedBySleep(t *testing.T) {
 	s := New(Config{
-		CheckinHours:   []int{9},
-		TravelHours:    []int{9}, // 与签到同刻：验证同刻合并
-		ActivityHours:  []int{10},
-		KeepaliveHours: []int{21},
-		SchoolHours:    []int{12},
-		CatHours:       []int{1},
+		CheckinHours:    []int{9},
+		TravelHours:     []int{9}, // 与签到同刻：验证同刻合并
+		ActivityHours:   []int{10},
+		KeepaliveHours:  []int{21},
+		SchoolHours:     []int{12},
+		CatHours:        []int{1},
+		BillingDisabled: true,
 	})
 	cursor := time.Date(2026, 9, 27, 20, 0, 0, 0, time.Local)
 	now := time.Date(2026, 9, 28, 9, 5, 0, 0, time.Local)

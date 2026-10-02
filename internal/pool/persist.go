@@ -183,6 +183,12 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			sessionDeadFails: s.SessionDeadFails,
 			consecutiveFails: s.ConsecutiveFails,
 			creditsExpiring:  expiring,
+			// 闸门位与"余额是否权威"随状态一起恢复（gate.go）：否则重启会把刚摘掉的
+			// 号放回付费模型重演打空，并把"已核查"降级成"未知"导致全池保守进闸。
+			// 恢复的是**上次的判定结果**；main 注入配置时 SetSGGate 会按当前阈值重算，
+			// 所以改了阈值不必等重启后的下一轮轮询。
+			creditsKnown: s.CreditsKnown,
+			sgGated:      s.SGGated,
 		}
 		// 恢复熔断器：breakerUntil 在未来才恢复（惰性过滤过期/零值，与落盘同口径）。
 		// retryCount 仅在 breakerUntil 未过期时恢复——已过期则归零（不保留无用退避指数）。
@@ -430,6 +436,8 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			BreakerUntil:     breakerUntil,
 			RetryCount:       retryCount,
 			CreditsExpiring:  e.creditsExpiring,
+			CreditsKnown:     e.creditsKnown,
+			SGGated:          e.sgGated,
 			ModelCooldowns:   mcs,
 			ModelCosts:       mcosts,
 		}

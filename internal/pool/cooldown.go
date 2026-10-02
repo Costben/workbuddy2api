@@ -38,6 +38,11 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, expiring int64) {
 		}
 		e.credits = credits
 		e.creditsExpiring = expiring
+		// 权威余额到达：标记 creditsKnown 并按滞回阈值重算 SG 闸门位（gate.go）。
+		// 这是「余额未知 → 保守进闸」的唯一出口——首次 billing 轮询/签到后真实余额
+		// 即生效，余额充足的号立刻恢复付费模型可用（不必等重启或人工干预）。
+		e.creditsKnown = true
+		p.applySGGateLocked(e)
 		p.dirty.Store(true)
 	}
 }

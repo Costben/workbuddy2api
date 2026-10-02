@@ -52,6 +52,15 @@ type Status struct {
 	// samples）；无观测/全部过期 → nil（tier 1 未知层）。过期即消失（零回归，
 	// 只读遍历零风险）。tier 不单独落字段（可由 per1k≤0 推出，零冗余）。
 	ModelCosts []ModelCostStatus `json:"model_costs,omitempty"`
+	// SGGated 付费模型积分闸门位（见 gate.go）：该账号当前被摘除 sgGateModel 的
+	// 请求。**刻意不做成账号级 Cooling**——闸门只锁一个模型，免费模型照常服务，
+	// 若复用 cooling 字段会让面板把账号显示成"冷却中"，与实际可用性不符。
+	// 零值也显式写出（运维口径，同 consecutive_fails）。
+	SGGated bool `json:"sg_gated"`
+	// CreditsKnown 报告 Credits 是否来自权威余额核查（见 entry.creditsKnown）。
+	// 面板据此区分"余额 0"与"余额未知（从未核查）"——前者是真没钱，后者只是没数据。
+	// 零值也显式写出（运维口径，同上）。
+	CreditsKnown bool `json:"credits_known"`
 	Disabled          bool               `json:"disabled"`
 	DisabledReason    string             `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	// ManualDisabled 运维手动停用（issue #138/#118）——与 disabled **并列独立**，
@@ -111,6 +120,18 @@ type entry struct {
 	// 签到之间第四因子（weightOf ×8）不应失忆——签到 09:00/21:00 定期刷新，
 	// 窗口外重启会丢快过期积分偏好，可能让奖励积分到期作废。
 	creditsExpiring int64
+	// creditsKnown 报告 credits 是否来自**权威**余额核查（billing / get-user-resource）。
+	// 为什么需要它：global 账号不签到（scheduler.CheckinAll 对 global 直接 skip），
+	// credits 只会被 NoteModelCost 的扣减路径单调压低，从来没有权威写入——一个
+	// "余额 0" 的 global 号可能实际有几百积分。若直接按 credits 判定闸门，会把
+	// 全部 global 号一刀切摘掉。故闸门只信权威值：creditsKnown=false 时保守进闸
+	// （不打付费模型），首次 billing 轮询写入权威余额后立即按真实值重算。
+	// 持久化（stateAccount.CreditsKnown）：重启后不把"已知"降级成"未知"。
+	creditsKnown bool
+	// sgGated 付费模型闸门位（见 gate.go）：为 true 时该账号从 sgGateModel 的候选集
+	// 摘除，其余模型不受影响。由 applySGGateLocked 按权威余额 + 滞回阈值唯一驱动。
+	// 持久化（stateAccount.SGGated）：否则重启会把刚摘掉的号放回付费模型，重演打空。
+	sgGated bool
 	successCount    int64     // 累计成功
 	// errTotal 累计错误（终身累计，仅状态展示用；选号权重不消费——原「成功率」
 	// 因子已删，见 pick.weightOf 注释与 success-ema-review）。
@@ -394,6 +415,14 @@ type stateAccount struct {
 	// （weightOf ×8）的快过期积分偏好——重启后到下次签到之间不应失忆。
 	// 零值也显式写出（运维口径，见 err_total 注释）。
 	CreditsExpiring int64 `json:"credits_expiring"`
+	// CreditsKnown 报告 Credits 是否来自权威余额核查（见 entry.creditsKnown）。
+	// 持久化：重启后不把"已知"降级成"未知"，否则闸门会保守地把全部账号摘一遍。
+	// 零值也显式写出（运维口径，同上）。
+	CreditsKnown bool `json:"credits_known"`
+	// SGGated 付费模型闸门位（见 entry.sgGated / gate.go）。持久化：否则重启会把
+	// 刚摘掉的号放回付费模型，重演"打空积分连免费一起死"的原始故障。
+	// 零值也显式写出（运维口径，同上）。
+	SGGated bool `json:"sg_gated"`
 	// ModelCooldowns 6004 模型级独立冷却表（model → 冷却记录）。持久化：
 	// PR #96 把 6004 改成精确对齐上游重置墙钟后，单模型冷却可长达数小时，
 	// 跨重启是常态；不持久化导致每次重启 healthyForModel 失忆、重新踩一遍

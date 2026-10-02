@@ -37,6 +37,14 @@ type Pool struct {
 	exploreLast map[string]time.Time
 	// costExploreEvents 累计探索事件数（/status 透出；pick 写锁内 ++，无需 atomic）。
 	costExploreEvents int64
+	// sgGateModel / sgMinCredits / sgResumeCredits / sgGateRealm 付费模型积分闸门
+	// （SetSGGate 注入，见 gate.go）。sgGateModel=="" 或 sgMinCredits<=0 = 关闭。
+	// 语义：闸门 realm 内的账号，余额跌破 sgMinCredits 即从**该模型**的候选集摘除
+	// （entry.sgGated），回到 sgResumeCredits 以上才恢复；其余模型完全不受影响。
+	sgGateModel     string
+	sgMinCredits    int64
+	sgResumeCredits int64
+	sgGateRealm     string
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
 	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
 	degradeThreshold   int

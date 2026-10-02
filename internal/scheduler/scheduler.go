@@ -1,5 +1,10 @@
-// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子 六类独立排程。
+// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 /
+// 夜猫子 / 积分轮询（billing，patch 0002）七类独立排程。
 // 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻。
+//
+// 积分轮询为何独立成第七类：realm=global 的账号没有签到体系（CheckinAll 直接跳过），
+// 因此它们的 credits 只会被 NoteModelCost 单调扣减、永不刷新，是"死数字"——SG 闸门
+// 拿它当判据会把好号误摘。billing 轮询是 global 账号余额的唯一权威来源。
 package scheduler
 
 import (
@@ -19,8 +24,8 @@ import (
 
 // Config 调度器依赖。
 //
-// 任务开关用「禁用」命名而非「启用」：零值 Config 即六类任务都启用（hours 回落默认），
-// 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
+// 任务开关用「禁用」命名而非「启用」：零值 Config 即七类任务都启用（hours/interval
+// 回落默认），与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
 type Config struct {
 	Pool           *pool.Pool
 	Upstream       *upstream.Client
@@ -52,6 +57,19 @@ type Config struct {
 	SchoolDisabled bool
 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
 	CatDisabled bool
+
+	// BillingInterval 积分轮询间隔（patch 0002），默认 30m。<=0 回落默认；
+	// 低于 BillingMinInterval 钳到下限并打 WARN（避免对上游高频连发触发风控）。
+	// 为什么是「间隔」而不是像其余六类那样的整点小时表：轮询槽位必须能落在半点
+	// （:30）上，整点表表达不了（见 fixedIntervalSlots）。
+	BillingInterval time.Duration
+	// BillingMinInterval 轮询间隔下限，默认 10m。<=0 回落默认。
+	// 轮询越密，对上游 /get-user-resource 的调用越密，风控暴露面随之线性上升；
+	// 下限是"配错了也打不到上游脸上"的护栏，触发时打 WARN 而非静默钳。
+	BillingMinInterval time.Duration
+	// BillingDisabled 显式关闭积分轮询排程（schedule.billing_enabled=false）。
+	// 关闭后 global 账号余额不再刷新，SG 闸门失去判据（只剩最后一次已知值）。
+	BillingDisabled bool
 }
 
 // Scheduler 调度器。
@@ -97,6 +115,18 @@ func New(cfg Config) *Scheduler {
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = 1
 	}
+	if cfg.BillingMinInterval <= 0 {
+		cfg.BillingMinInterval = defaultBillingMinInterval
+	}
+	if cfg.BillingInterval <= 0 {
+		cfg.BillingInterval = defaultBillingInterval
+	}
+	// 低于下限不静默钳：打 WARN 说明"配小了、已按下限跑"，避免运维以为配置生效。
+	if cfg.BillingInterval < cfg.BillingMinInterval {
+		log.Printf("WARN: schedule.billing_interval=%s 低于下限 %s，已钳到下限（避免对上游高频连发）",
+			cfg.BillingInterval, cfg.BillingMinInterval)
+		cfg.BillingInterval = cfg.BillingMinInterval
+	}
 	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string), rewardClaimed: make(map[string]string)}
 }
 
@@ -141,6 +171,56 @@ func nextFire(now time.Time, hours []int) time.Time {
 	return earliest
 }
 
+// 积分轮询默认参数（patch 0002）。
+//
+// 30m 这个间隔不是随手取的：SG 闸门只能摘掉"余额已知不足"的号，摘不掉"两次核查
+// 之间被打空"的号——**轮询间隔就是闸门的最坏漏检窗口**。默认 30m 配 min_credits=50
+// 留出两次核查间的余量（-sg 实测约 0.0014~0.0057 credits/1k tokens，50 够跑很多轮）。
+// 下限 10m 是护栏：轮询越密，对上游的调用越密，风控暴露面线性上升。
+const (
+	defaultBillingInterval    = 30 * time.Minute
+	defaultBillingMinInterval = 10 * time.Minute
+)
+
+// fixedIntervalSlots 把「固定间隔」展开成日内分钟表（0-1439，升序）。
+//
+// 为什么要展开成分钟表而不是直接算 next = now.Truncate(interval)+interval：
+// 排程的身份必须是**墙钟槽位**（:00/:30/:15...）而不是"距上次唤醒过了多久"。
+// 否则机器睡一觉醒来，nextWake 与 dueSlots 会算出不同的槽位，补跑路径就会
+// 要么漏跑要么重复跑。展开成与 hours 同构的静态表后，两条路径天然一致。
+//
+// interval <= 0 或 > 24h 返回 nil（无槽位 = 不排程；24h 整除性无意义）。
+func fixedIntervalSlots(interval time.Duration) []int {
+	if interval <= 0 || interval > 24*time.Hour {
+		return nil
+	}
+	n := int((24 * time.Hour) / interval)
+	out := make([]int, 0, n)
+	dayStart := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < n; i++ {
+		t := dayStart.Add(time.Duration(i) * interval)
+		out = append(out, t.Hour()*60+t.Minute())
+	}
+	return out
+}
+
+// nextMinuteSlot 返回 now 之后最近的一个日内分钟表槽位：今天剩下的取最小，
+// 今天的都过了就取明天的第一个（minutes 需升序且非空）。
+//
+// 用 time.Date 逐字段构造而非 day.Add(...)：必须与 dueSlots 的构造方式逐字一致，
+// 否则夏令时切换日两条路径会算出不同的时刻，补跑判定随即错位。
+func nextMinuteSlot(now time.Time, minutes []int) time.Time {
+	loc := now.Location()
+	for _, m := range minutes {
+		t := time.Date(now.Year(), now.Month(), now.Day(), m/60, m%60, 0, 0, loc)
+		if t.After(now) {
+			return t
+		}
+	}
+	return time.Date(now.Year(), now.Month(), now.Day(), minutes[0]/60, minutes[0]%60, 0, 0, loc).
+		AddDate(0, 0, 1)
+}
+
 // taskKind 调度任务类型。
 type taskKind int
 
@@ -150,23 +230,36 @@ type slot struct {
 	kind taskKind
 }
 
-// schedule 一类任务的排程：小时表 + 该类的启用位。
+// schedule 一类任务的排程：小时表（或日内分钟表）+ 该类的启用位。
+//
+// minutes 非空时优先于 hours：积分轮询用固定间隔排程，槽位要落在半点上，
+// 整点小时表表达不了，故另开一张日内分钟表。其余六类恒走 hours。
 type schedule struct {
 	hours    []int
 	kind     taskKind
 	disabled bool
+	minutes  []int // 日内分钟表（0-1439）；非空时优先于 hours
 }
 
-// schedules 六类任务的排程表（顺序即 kinds 的稳定顺序）。
+// schedules 七类任务的排程表（顺序即 kinds 的稳定顺序）。
 func (s *Scheduler) schedules() []schedule {
 	return []schedule{
-		{s.cfg.CheckinHours, taskCheckin, s.cfg.CheckinDisabled},
-		{s.cfg.TravelHours, taskTravel, s.cfg.TravelDisabled},
-		{s.cfg.ActivityHours, taskActivity, s.cfg.ActivityDisabled},
-		{s.cfg.KeepaliveHours, taskKeepalive, s.cfg.KeepaliveDisabled},
-		{s.cfg.SchoolHours, taskSchool, s.cfg.SchoolDisabled},
-		{s.cfg.CatHours, taskCat, s.cfg.CatDisabled},
+		{s.cfg.CheckinHours, taskCheckin, s.cfg.CheckinDisabled, nil},
+		{s.cfg.TravelHours, taskTravel, s.cfg.TravelDisabled, nil},
+		{s.cfg.ActivityHours, taskActivity, s.cfg.ActivityDisabled, nil},
+		{s.cfg.KeepaliveHours, taskKeepalive, s.cfg.KeepaliveDisabled, nil},
+		{s.cfg.SchoolHours, taskSchool, s.cfg.SchoolDisabled, nil},
+		{s.cfg.CatHours, taskCat, s.cfg.CatDisabled, nil},
+		{nil, taskBilling, s.cfg.BillingDisabled, s.billingMinutes()},
 	}
+}
+
+// billingMinutes 积分轮询的日内分钟表；关闭或无有效间隔时返回 nil（不排程）。
+func (s *Scheduler) billingMinutes() []int {
+	if s.cfg.BillingDisabled || s.cfg.BillingInterval <= 0 {
+		return nil
+	}
+	return fixedIntervalSlots(s.cfg.BillingInterval)
 }
 
 const (
@@ -176,6 +269,7 @@ const (
 	taskKeepalive
 	taskSchool
 	taskCat
+	taskBilling
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -185,6 +279,10 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	var slots []slot
 	for _, sch := range s.schedules() {
 		if sch.disabled {
+			continue
+		}
+		if len(sch.minutes) > 0 {
+			slots = append(slots, slot{nextMinuteSlot(now, sch.minutes), sch.kind})
 			continue
 		}
 		slots = append(slots, slot{nextFire(now, sch.hours), sch.kind})
@@ -295,6 +393,16 @@ func (s *Scheduler) dueSlots(cursor, now time.Time) []dueSlot {
 			if sch.disabled {
 				continue
 			}
+			if len(sch.minutes) > 0 {
+				for _, m := range sch.minutes {
+					t := time.Date(day.Year(), day.Month(), day.Day(), m/60, m%60, 0, 0, loc)
+					if !t.After(start) || t.After(now) {
+						continue
+					}
+					out = append(out, dueSlot{planned: t, kinds: []taskKind{sch.kind}})
+				}
+				continue
+			}
 			for _, h := range sch.hours {
 				t := time.Date(day.Year(), day.Month(), day.Day(), h, 0, 0, 0, loc)
 				if !t.After(start) || t.After(now) {
@@ -341,7 +449,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// ② 再等下一个槽位：分段小睡、每段重新对墙钟（睡眠跨过槽位也能按时发现）。
 		next, kinds := s.nextWake(cursor)
 		if next.IsZero() {
-			// 六类任务全部禁用：不空转，只等退出信号。
+			// 七类任务全部禁用：不空转，只等退出信号。
 			<-ctx.Done()
 			return
 		}
@@ -399,6 +507,8 @@ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 		s.RunSchoolNow()
 	case taskCat:
 		s.RunCatNow()
+	case taskBilling:
+		s.RunBillingNow()
 	}
 }
 

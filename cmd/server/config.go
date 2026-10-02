@@ -139,6 +139,22 @@ type Config struct {
 		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
 		// 空值回落默认。
 		CostExploreInterval string `json:"cost_explore_interval"`
+		// SG 积分闸门（patch 0002）：global 域的付费模型（如 deepseek-v4.1-flash-sg）
+		// 与免费模型共用同一批账号，付费模型打空积分会让账号整体撞 402 → 账号级
+		// 硬冷却 → 免费池一起死。闸门把"余额不足的号"只从付费模型的候选集里摘掉，
+		// 其余模型不受影响，因此免费池规模与付费池规模解耦。
+		//   enabled          false = 完全关闭（回到引入前行为）
+		//   model            闸门锁定的模型名（精确匹配请求模型名，含 -sg 后缀）
+		//   min_credits      余额低于此值 → 摘除该模型请求（默认 50）
+		//   resume_credits   余额回到此值以上才恢复（默认 120，须 >= min_credits）
+		//   realm            生效域，默认 "global"；"*" = 全域
+		SGGate struct {
+			Enabled       bool   `json:"enabled"`
+			Model         string `json:"model"`
+			MinCredits    int64  `json:"min_credits"`
+			ResumeCredits int64  `json:"resume_credits"`
+			Realm         string `json:"realm"`
+		} `json:"sg_gate"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -159,6 +175,9 @@ type Config struct {
 	ExpiringSoonDur     time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
+	// BillingIntervalDur 解析后的积分轮询间隔（schedule.billing_interval，默认 30m）。
+	// 下限钳制在 scheduler.New 里做（那里能打 WARN），此处只负责解析与回落。
+	BillingIntervalDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -204,6 +223,15 @@ func Default() *Config {
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
+	// SG 积分闸门默认值（patch 0002）：默认**关闭**（enabled=false）——升级后行为
+	// 与引入前逐字一致，是否启用由运维在 config.json 显式打开。model 预填用户实际
+	// 使用的付费模型名，开启时无需再查；阈值 50/120 为运维口径（低于 50 摘除，
+	// 回到 120 以上才恢复）——配合 30m 的核查间隔，留出两次核查之间被打穿的余量。
+	c.Pool.SGGate.Enabled = false
+	c.Pool.SGGate.Model = "deepseek-v4.1-flash-sg"
+	c.Pool.SGGate.MinCredits = 50
+	c.Pool.SGGate.ResumeCredits = 120
+	c.Pool.SGGate.Realm = "global"
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -381,6 +409,34 @@ func (c *Config) normalize() error {
 	}
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
+	}
+	// 积分轮询间隔（schedule.billing_interval，默认 "30m"）：空值回落默认（Default 已置；
+	// 此兜底覆盖显式 ""）。解析失败快速失败——间隔直接决定闸门的最坏漏检窗口，
+	// 静默回落默认会让运维以为配生效了。下限（scheduler.defaultBillingMinInterval）
+	// 不在这里钳：那里能打 WARN 说明"配小了"，静默钳会让配置看起来生效。
+	if c.Schedule.BillingInterval == "" {
+		c.Schedule.BillingInterval = "30m"
+	}
+	if c.BillingIntervalDur, err = time.ParseDuration(c.Schedule.BillingInterval); err != nil {
+		return fmt.Errorf("schedule.billing_interval: %w", err)
+	}
+	// SG 积分闸门归一（patch 0002）：只做「取值合法化」，**不**在这里改变 enabled
+	// 语义——enabled=false 一律保持关闭（即使 model/min_credits 有值）。
+	//   - min_credits <= 0 → 回落 50（阈值 0 无意义，会让闸门永不触发）
+	//   - resume_credits < min_credits → 钳到 min_credits（滞回窗口退化但不出错）
+	//   - realm 空 → "global"（本闸门的设计目标域）
+	//   - model 空 → "deepseek-v4.1-flash-sg"（缺省目标模型）
+	if c.Pool.SGGate.MinCredits <= 0 {
+		c.Pool.SGGate.MinCredits = 50
+	}
+	if c.Pool.SGGate.ResumeCredits < c.Pool.SGGate.MinCredits {
+		c.Pool.SGGate.ResumeCredits = c.Pool.SGGate.MinCredits
+	}
+	if c.Pool.SGGate.Realm == "" {
+		c.Pool.SGGate.Realm = "global"
+	}
+	if c.Pool.SGGate.Model == "" {
+		c.Pool.SGGate.Model = "deepseek-v4.1-flash-sg"
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120

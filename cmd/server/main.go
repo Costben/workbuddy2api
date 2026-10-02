@@ -85,6 +85,10 @@ func main() {
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
+	// SG 积分闸门（patch 0002）：把余额不足的账号只从付费模型的候选集摘掉，
+	// 免费模型不受影响。enabled=false（默认）时完全关闭，行为与引入前一致。
+	p.SetSGGate(cfg.Pool.SGGate.Enabled, cfg.Pool.SGGate.Model,
+		cfg.Pool.SGGate.MinCredits, cfg.Pool.SGGate.ResumeCredits, cfg.Pool.SGGate.Realm)
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -155,12 +159,14 @@ func main() {
 		CatHours:            cfg.Schedule.CatHours,
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
+		BillingInterval:     cfg.BillingIntervalDur,
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
 		TravelDisabled:      !cfg.Schedule.TravelEnabled,
 		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
 		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
 		CatDisabled:         !cfg.Schedule.CatEnabled,
+		BillingDisabled:     !cfg.Schedule.BillingEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -194,6 +200,19 @@ func main() {
 		log.Printf("夜猫子任务已禁用（schedule.cat_enabled=false）")
 	} else {
 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
+	}
+	// SG 积分闸门启动回执：一眼确认闸门是开是关、锁的哪个模型、阈值多少。
+	if cfg.Pool.SGGate.Enabled {
+		log.Printf("SG 积分闸门已启用：模型=%s 域=%s 余额<%d 摘除 / 余额>=%d 恢复",
+			cfg.Pool.SGGate.Model, cfg.Pool.SGGate.Realm,
+			cfg.Pool.SGGate.MinCredits, cfg.Pool.SGGate.ResumeCredits)
+	} else {
+		log.Printf("SG 积分闸门未启用（pool.sg_gate.enabled=false）")
+	}
+	if !cfg.Schedule.BillingEnabled {
+		log.Printf("积分轮询已禁用（schedule.billing_enabled=false）——global 账号余额将不再刷新")
+	} else {
+		log.Printf("积分轮询已启用：每 %s 一轮（全域余额核查，global 账号的唯一余额来源）", cfg.BillingIntervalDur)
 	}
 
 	h := server.NewHandler(server.Config{
