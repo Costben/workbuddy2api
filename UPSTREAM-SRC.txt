@@ -4,5 +4,5 @@
 维护者留存并继续维护。许可为 MIT（见 LICENSE，版权归原作者）——再分发请保留
 LICENSE 与版权声明。
 
-打包说明：工具 schema 的 pattern 里 `\_` 这类非标准转义会被上游 RE2 拒收（code 11129，症状是聊天正常、工具调用一律失败），出站前归一为 `_`；tools 与旧式 functions 两种声明形态都覆盖（issue #112，由 gogoing1024 提供修正）
-打包时间：2026-10-01 21:17:07
+打包说明：出站 Transport 接上标准环境变量代理（HTTP_PROXY / HTTPS_PROXY / NO_PROXY）：自定义 Transport 不设 Proxy 字段即为 nil，代理被静默忽略（issue #136，群晖 + 代理出网部署）
+打包时间：2026-10-05 19:28:02
