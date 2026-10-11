@@ -4,5 +4,5 @@
 维护者留存并继续维护。许可为 MIT（见 LICENSE，版权归原作者）——再分发请保留
 LICENSE 与版权声明。
 
-打包说明：脚本在 Windows 中文区域不再因 emoji 昵称崩溃（stdout/stderr 钉成 UTF-8，errors=replace 兜底，覆盖 task_runner / global_region / school_open_day 三个入口）；另含出站 Transport 接环境变量代理（issue #136）
-打包时间：2026-10-08 11:36:14
+打包说明：模型清单补 Magpie 兼容字段：modalities.input 含 image、supported_reasoning_levels（issue #156，只增不改）；另含工具结果配对与 11148 请求级返回（#154）、环境变量代理（#136）、脚本 UTF-8（#147）
+打包时间：2026-10-10 19:12:40
