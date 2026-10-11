@@ -262,7 +262,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		// completion_tokens（部分上游末帧缺 total），网关合成补齐——否则严格按
 		// schema 校验的客户端收不到 total_tokens。已有 total 或二者缺一不补
 		// （不臆造：单边有值无法合成可信的 total）。
-		resp["usage"] = ensureUsageTotal(usage)
+		resp["usage"] = ensureUsageTotal(normalizeCacheUsage(usage))
 	}
 	return resp, nil
 }
@@ -455,6 +455,9 @@ func normalizeFrame(obj map[string]any) map[string]any {
 		out["choices"] = nchs
 	}
 	if u, ok := obj["usage"]; ok {
+		if usage, ok := u.(map[string]any); ok {
+			u = normalizeCacheUsage(usage)
+		}
 		out["usage"] = u
 	} else {
 		out["usage"] = nil

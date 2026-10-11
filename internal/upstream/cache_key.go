@@ -20,17 +20,17 @@ import (
 //
 // 优先级：
 //  1. body 已带 prompt_cache_key → 原值保留（客户端自知复用哪个键）
-//  2. body 已带 conversation_id / conversationId → 用它做会话哈希源
-//  3. 都没有 → 用入站 conversationID 参数（来自 X-Conversation-ID 头解析）
+//  2. handler 已解析稳定会话源 → 用入站 conversationID 参数做会话哈希源
+//  3. 参数为空 → 用 body 的 conversation_id / conversationId
 //
 // 安全约束——按账号隔离：
 //   - 生成键格式 `wb2a-<uid8>-<convHex>`
-//   - uid8 是账号 UID 前 8 字符，跨账号绝不相同 → 跨账号缓存键绝不碰撞
-//   - 跨账号复用同一 cache key 会让上游命中错账号的前缀缓存、泄露对方对话，故 uid 是硬隔离因子
+//   - uid8 仅供辨识；会话段的哈希包含完整 UID，保证不同账号使用不同命名空间
+//   - 相同的缓存键不会让不同账号共享上游缓存；上游仍按账号 UID 隔离
 //
 // 入参 uid 为账号 UID（空则用 "-"，但仍会注入键；调用方应保证传真实 UID）。
-// 入参 conversationID 为网关解析出的会话标识（body 里没有 conversation_id 时用它做哈希源）。
-// 两源都空时 convHex 为定值（每次新会话不复用前缀，但仍保留账号隔离段）。
+// 入参 conversationID 为网关解析出的稳定会话标识，账号粘性与缓存键共用这个源。
+// 两源都空时 convHex 由 UID 单独派生，同账号得到同一个键；是否命中仍取决于内容前缀。
 // body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不二次错误化）。
 func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	if len(body) == 0 {
@@ -44,12 +44,15 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	if existing, ok := obj["prompt_cache_key"].(string); ok && existing != "" {
 		return body
 	}
-	// 优先级 2：body 里的 conversation_id / conversationId 做会话哈希源。
+	// 使用 handler 已解析的会话标识，使账号绑定与缓存键共享同一会话源。
+	// 独立调用时才回落 body 的 conversation_id / conversationId。
 	conv := conversationID
-	if v := strField(obj, "conversation_id"); v != "" {
-		conv = v
-	} else if v := strField(obj, "conversationId"); v != "" {
-		conv = v
+	if conv == "" {
+		if v := strField(obj, "conversation_id"); v != "" {
+			conv = v
+		} else if v := strField(obj, "conversationId"); v != "" {
+			conv = v
+		}
 	}
 	key := buildCacheKey(uid, conv)
 	obj["prompt_cache_key"] = key
@@ -64,7 +67,7 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 //
 // uid8 提供账号隔离段；convHex = sha256(uid + conversationID)[:16] 的 hex 提供会话段
 // （同账号同会话稳定、不同会话不同）。会话源为空时 convHex 仍由 uid 单独哈希，
-// 保证跨账号绝不碰撞但同一空会话不复用（空会话 = 新会话语义）。
+// 保持账号命名空间；同账号的空会话源会产生相同键。
 func buildCacheKey(uid, conversation string) string {
 	uid8 := uid
 	if len(uid8) > 8 {

@@ -107,6 +107,7 @@ func main() {
 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏，
 			// 见 wiring.go）；裸名走 cn（现状零回归）。
 			AvailableForModel: realmAwareAvailableForModel(p),
+			EligibleForModel:  realmAwareEligibleForModel(p, cfg.SessionWaitTimeout),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -220,6 +221,7 @@ func main() {
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
 		Session:      sessRouter,
+		StickyWait:   cfg.SessionWaitTimeout,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,

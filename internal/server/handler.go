@@ -30,6 +30,8 @@ type Config struct {
 	MaxRotate int    // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
+	// StickyWait: positive waits for a healthy bound account; zero keeps rotation.
+	StickyWait time.Duration
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
 	StickyCount func() int
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
@@ -540,12 +542,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	tried := map[string]bool{}
 	var lastErr error
 
-	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
+	// 会话粘性：先取稳定会话头，再取请求体的会话键并解析绑定号。
 	// 按模型解析：同一个会话可能换模型，绑定号若在当前模型上被 6004 限额（对其他模型
 	// 仍可用），必须重分配——否则会被钉在这个号上反复失败。
 	// 提取与下方会话头族的聚合键共用同一结果，故**不受粘性开关影响**：粘性未启用
 	// （Session==nil）时聚合键仍应是会话级，而不是退化成轮级。
-	sessKey := session.ExtractKey(body)
+	sessKey := session.ExtractRequestKey(r.Header, body)
 	// stickyKey 是**粘性专用**键，与 sessKey（会话头族聚合用）分开：
 	// sessKey 为空时（OpenAI 兼容客户端——dsh / Codex 等既无 conversationId 也无
 	// metadata）用首条 user 消息派生会话级 fallback 键，使粘性仍能生效。
@@ -653,6 +655,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//       一次即共享。
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
 	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
+	chatMeta.CacheConversationID = stickyKey
+	if sessKey != "" {
+		chatMeta.ConversationID = sessKey
+	}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
 	} else if turnKey != "" && sessKey != "" {
@@ -673,8 +679,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
+		alreadyAcquired := false
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
+			if h.cfg.StickyWait > 0 {
+				var waitErr error
+				acct, waitErr = h.acquireSticky(r.Context(), stickyUID, bareModel, realm)
+				if waitErr != nil {
+					if errors.Is(waitErr, errStickyBusy) {
+						w.Header().Set("Retry-After", "1")
+						writeOpenAIError(w, http.StatusTooManyRequests, "sticky_account_busy", "session account is busy; retry this session")
+						st.status = http.StatusTooManyRequests
+					} else {
+						st.status = 499 // client canceled; no upstream request or lease
+					}
+					return
+				}
+				alreadyAcquired = acct != nil
+			} else {
+				acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
+			}
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑。
 				unbindSticky()
@@ -695,7 +718,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		tried[acct.UID] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
-		if !h.cfg.Pool.Acquire(acct.UID) {
+		if !alreadyAcquired && !h.cfg.Pool.Acquire(acct.UID) {
 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
 			// 满载粘性号再浪费一次粘性命中往返（语义与 fail()/粘性命中-nil 的解绑一致）。
 			if stickyUID != "" && acct.UID == stickyUID {

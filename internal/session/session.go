@@ -42,6 +42,9 @@ type Config struct {
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
 	AvailableForModel func(model string) []string
+	// EligibleForModel excludes failed/disabled accounts but retains busy ones.
+	// It validates existing bindings only; new assignments use AvailableForModel.
+	EligibleForModel func(model string) []string
 }
 
 // Router 会话粘性路由器。
@@ -142,13 +145,20 @@ func (r *Router) LoadFromStore() {
 func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	now := time.Now()
 	available := r.availableSet(model)
+	eligible := available
+	if r.cfg.EligibleForModel != nil {
+		eligible = map[string]bool{}
+		for _, uid := range r.cfg.EligibleForModel(model) {
+			eligible[uid] = true
+		}
+	}
 
 	// ── Fast path: RLock 快查 ──────────────────────────────
 	r.mu.RLock()
 	e, found := r.entries[key]
 	r.mu.RUnlock()
 	if found && !expired(e, now, r.cfg.TTL) {
-		if available[e.uid] {
+		if eligible[e.uid] {
 			r.touch(key, e.uid, now)
 			return e.uid, true
 		}
@@ -161,7 +171,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
 	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
-		if available[e2.uid] {
+		if eligible[e2.uid] {
 			r.entries[key] = entry{uid: e2.uid, lastActive: now}
 			return e2.uid, true
 		}
@@ -305,11 +315,11 @@ func hashIndex(key string, n int) int {
 //  5. prompt_cache_key（第 5 项，见下）
 //
 // 前四项均为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
-//（P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
+// （P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
 // user 的全部并行对话会钉同一账号（粘性范围远大于上游 prompt cache 的对话级边界），
 // 且曾抢占顶层 conversation_id 的优先级。剔除后发 user_id 的客户端回落加权轮换
-//（与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
-//（7d 兜底）自然过期，键消失不产生脏绑定。
+// （与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
+// （7d 兜底）自然过期，键消失不产生脏绑定。
 //
 // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
 // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
@@ -361,6 +371,8 @@ func ExtractKey(body []byte) string {
 //
 // 为什么取首条：会话内历史不断追加，但首条 user 消息在整段会话中恒定 → 同会话恒同键；
 // 用户开新会话（首条消息不同）→ 自然换键。
+// compaction 删掉首条 user 后，此兜底键会改变；应由 ExtractRequestKey 接收
+// 客户端持续保留的会话 ID，不能靠重新哈希截断后的正文恢复原会话。
 //
 // 与 TurnKey 的区别（勿混用）：TurnKey 取**最后一条** user 消息，是**轮级**键，供上游
 // 会话头族按"对话轮"聚合；本函数取**首条**，是**会话级**键，供粘性绑定长期复用。

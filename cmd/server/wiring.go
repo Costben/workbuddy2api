@@ -1,6 +1,7 @@
 package main
 
 import (
+	"time"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/server"
 )
@@ -17,5 +18,15 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 	return func(model string) []string {
 		realm, bare := server.ResolveModel(model)
 		return p.AvailableUIDsForModelRealm(bare, realm)
+	}
+}
+
+func realmAwareEligibleForModel(p *pool.Pool, wait time.Duration) func(model string) []string {
+	if wait <= 0 {
+		return nil
+	}
+	return func(model string) []string {
+		realm, bare := server.ResolveModel(model)
+		return p.StickyEligibleUIDsForModelRealm(bare, realm)
 	}
 }
