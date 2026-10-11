@@ -65,15 +65,25 @@ find . -type f -not -path "*/.git/*" -not -path "*/patches/*" -name "*.md" -exec
 find . -type f -not -path "*/.git/*" -not -path "*/patches/*" -name "*.yml" -exec perl -pi -e 's/\r\n/\n/g' {} +
 
 echo "=== 3. 逐个应用 patches/ 目录下的补丁 ==="
+# 判据必须与 NAS 侧 /vol1/1000/Docker/gateway-autoupdate/updater.py 的 patch_tree() 同口径：
+#   1) 正向 --check 通过 → 应用
+#   2) 反向 --check 通过 → 判定「已在源码中」，跳过
+#   3) 两者皆不通过      → 失败并终止
+# 刻意不使用 --ignore-whitespace：宽松模式只会让云端放行、下游拒绝的补丁蒙混过关，
+# 而下游拒绝后只是每天静默保留旧版本、不报错，问题要拖到几天后才被发现。
+# 宁可在这里红。改动本段时必须同步改 updater.py 的 patch_tree()。
 PATCH_FAILED=0
 for patch_file in patches/*.patch; do
   [ -e "$patch_file" ] || continue
   echo "正在应用补丁: $patch_file"
-  if git apply --check --ignore-whitespace "$patch_file" 2>&1; then
-    git apply --ignore-whitespace "$patch_file"
+  if git apply --check -p1 "$patch_file" >/dev/null 2>&1; then
+    git apply -p1 "$patch_file"
     echo "✅ 成功应用 $patch_file"
+  elif git apply --reverse --check -p1 "$patch_file" >/dev/null 2>&1; then
+    echo "⏭️  补丁已在源码中，跳过: $patch_file"
   else
     echo "❌ 补丁冲突: $patch_file 无法干净应用！"
+    git apply --check -p1 "$patch_file" 2>&1 || true
     PATCH_FAILED=1
   fi
 done
