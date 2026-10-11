@@ -48,11 +48,45 @@ jobs:
             echo "无需更新：工作区无变更"
           fi
 
-      - name: Create Issue on failure
+      - name: Close auto-sync failure issue on success
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="🚨 [Auto-Sync] 上游快照同步或补丁应用失败"
+          EXISTING="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,title --jq '.[] | "\(.number)\t\(.title)"' \
+            | awk -F'\t' -v t="$TITLE" '$2 == t { print $1; exit }')"
+          if [ -z "$EXISTING" ]; then
+            echo "无未关闭的同步失败 issue，跳过。"
+            exit 0
+          fi
+          gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" \
+            --body "本次同步已通过，自动关闭该 issue。"
+          gh issue close "$EXISTING" --repo "$GITHUB_REPOSITORY" --reason completed
+          echo "已关闭 issue #$EXISTING"
+
+      - name: Report failure (create or update issue)
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh issue create \
-            --title "🚨 [Auto-Sync] 上游快照同步或补丁应用失败" \
-            --body "检测到 ithtelab/workbuddy-manager 的 upstream-src 快照有更新，但在应用 patches/ 下的本地补丁时发生冲突或错误。详情请查看此 Actions 运行日志。"
+          TITLE="🚨 [Auto-Sync] 上游快照同步或补丁应用失败"
+          BODY="$(printf '%s\n' \
+            '检测到 ithtelab/workbuddy-manager 的 upstream-src 快照有更新，但在应用 patches/ 下的本地补丁时发生冲突或错误。' \
+            '' \
+            "运行日志: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "触发方式: ${GITHUB_EVENT_NAME}" \
+            "commit: ${GITHUB_SHA}")"
+          # 同一个失败可能连着挂好几天（例如上游改了补丁锚点），
+          # 每次都新建 issue 会把列表刷满。已有未关闭的同名 issue 时追加评论。
+          EXISTING="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,title --jq '.[] | "\(.number)\t\(.title)"' \
+            | awk -F'\t' -v t="$TITLE" '$2 == t { print $1; exit }')"
+          if [ -n "$EXISTING" ]; then
+            echo "已有未关闭的同名 issue #$EXISTING，追加评论。"
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+          else
+            echo "创建新的同步失败 issue。"
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
+          fi
