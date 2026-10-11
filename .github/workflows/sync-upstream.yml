@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '0 20 * * *'
   workflow_dispatch:
+    inputs:
+      force_sync:
+        description: '忽略快照指纹强制重新同步（新增补丁首次生效时需要）'
+        type: boolean
+        default: false
   push:
     paths:
       - '.github/workflows/sync-upstream.yml'
@@ -23,6 +28,8 @@ jobs:
 
       - name: Run sync and patch script
         id: sync_run
+        env:
+          FORCE_SYNC: ${{ inputs.force_sync && '1' || '0' }}
         run: |
           chmod +x ./sync.sh
           ./sync.sh

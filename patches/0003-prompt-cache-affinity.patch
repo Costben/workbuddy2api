@@ -1,0 +1,847 @@
+diff --git a/cmd/server/config.go b/cmd/server/config.go
+index af989d0..6df7d34 100644
+--- a/cmd/server/config.go
++++ b/cmd/server/config.go
+@@ -117,17 +117,17 @@ type Config struct {
+ 	} `json:"upstash"`
+ 
+ 	Pool struct {
+-		MaxInFlight        int     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+-		MaxInFlightGlobal  int     `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
+-		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+-		BreakerCooldown    string  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+-		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
++		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
++		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
++		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
++		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
++		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+ 		// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）：
+ 		// ErrClient/传输层这类「不罚号」失败连续计数，达阈临时出池。与冷却/熔断
+ 		// 并存取更长者不叠加。默认 5 次 / 10m。
+-		DegradeThreshold   int    `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
+-		DegradeCooldown    string `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
+-		DegradeCooldownMax string `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
++		DegradeThreshold   int     `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
++		DegradeCooldown    string  `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
++		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
+ 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
+ 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+ 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
+@@ -158,9 +158,10 @@ type Config struct {
+ 	} `json:"pool"`
+ 
+ 	SessionSticky struct {
+-		Enabled    bool   `json:"enabled"`     // 默认 true
+-		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
+-		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
++		Enabled     bool   `json:"enabled"`      // 默认 true
++		TTL         string `json:"ttl"`          // 会话绑定 TTL，默认 "30m"
++		GCInterval  string `json:"gc_interval"`  // 会话 GC 周期，默认 "5m"
++		WaitTimeout string `json:"wait_timeout"` // 健康粘性号满载时等待，默认 "2s"；"0s" 关闭
+ 	} `json:"session_sticky"`
+ 
+ 	// 解析后
+@@ -172,6 +173,7 @@ type Config struct {
+ 	DegradeCooldownMaxD time.Duration `json:"-"`
+ 	SessionTTL          time.Duration `json:"-"`
+ 	SessionGCInterval   time.Duration `json:"-"`
++	SessionWaitTimeout  time.Duration `json:"-"`
+ 	ExpiringSoonDur     time.Duration `json:"-"`
+ 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
+ 	CostExploreIntervalDur time.Duration `json:"-"`
+@@ -235,6 +237,7 @@ func Default() *Config {
+ 	c.SessionSticky.Enabled = true
+ 	c.SessionSticky.TTL = "30m"
+ 	c.SessionSticky.GCInterval = "5m"
++	c.SessionSticky.WaitTimeout = "2s"
+ 	return c
+ }
+ 
+@@ -365,6 +368,12 @@ func (c *Config) normalize() error {
+ 	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
+ 		return fmt.Errorf("session_sticky.gc_interval: %w", err)
+ 	}
++	if c.SessionWaitTimeout, err = time.ParseDuration(c.SessionSticky.WaitTimeout); err != nil {
++		return fmt.Errorf("session_sticky.wait_timeout: %w", err)
++	}
++	if c.SessionWaitTimeout < 0 || c.SessionWaitTimeout > 10*time.Second {
++		return fmt.Errorf("session_sticky.wait_timeout must be between 0s and 10s")
++	}
+ 	if c.Pool.BreakerThreshold <= 0 {
+ 		c.Pool.BreakerThreshold = 3
+ 	}
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index 00059e0..a2893a9 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -107,6 +107,7 @@ func main() {
+ 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏，
+ 			// 见 wiring.go）；裸名走 cn（现状零回归）。
+ 			AvailableForModel: realmAwareAvailableForModel(p),
++			EligibleForModel:  realmAwareEligibleForModel(p, cfg.SessionWaitTimeout),
+ 		})
+ 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
+ 		sessRouter.StartGC()
+@@ -220,6 +221,7 @@ func main() {
+ 		Upstream:     up,
+ 		APIKey:       cfg.APIKey,
+ 		Session:      sessRouter,
++		StickyWait:   cfg.SessionWaitTimeout,
+ 		StickyCount:  sessCount,
+ 		RedisMode:    redisMode,
+ 		SoftCooldown: cfg.SoftRateDur,
+diff --git a/cmd/server/wiring.go b/cmd/server/wiring.go
+index a5efefb..2f30ce4 100644
+--- a/cmd/server/wiring.go
++++ b/cmd/server/wiring.go
+@@ -1,6 +1,7 @@
+ package main
+ 
+ import (
++	"time"
+ 	"workbuddy2api/internal/pool"
+ 	"workbuddy2api/internal/server"
+ )
+@@ -18,4 +19,14 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
+ 		realm, bare := server.ResolveModel(model)
+ 		return p.AvailableUIDsForModelRealm(bare, realm)
+ 	}
+-}
+\ No newline at end of file
++}
++
++func realmAwareEligibleForModel(p *pool.Pool, wait time.Duration) func(model string) []string {
++	if wait <= 0 {
++		return nil
++	}
++	return func(model string) []string {
++		realm, bare := server.ResolveModel(model)
++		return p.StickyEligibleUIDsForModelRealm(bare, realm)
++	}
++}
+diff --git a/config.example.json b/config.example.json
+index 9e0ba20..b35660a 100644
+--- a/config.example.json
++++ b/config.example.json
+@@ -83,6 +83,7 @@
+   "session_sticky": {
+     "enabled": true,
+     "ttl": "30m",
+-    "gc_interval": "5m"
++    "gc_interval": "5m",
++    "wait_timeout": "2s"
+   }
+ }
+diff --git a/internal/pool/sticky.go b/internal/pool/sticky.go
+new file mode 100644
+index 0000000..5129427
+--- /dev/null
++++ b/internal/pool/sticky.go
+@@ -0,0 +1,50 @@
++package pool
++
++import (
++	"sort"
++	"time"
++
++	"workbuddy2api/internal/auth"
++)
++
++// StickyEligibleUIDsForModelRealm keeps healthy busy accounts eligible for an
++// existing binding. New bindings still use the capacity-aware available list.
++func (p *Pool) StickyEligibleUIDsForModelRealm(model, realm string) []string {
++	p.mu.RLock()
++	defer p.mu.RUnlock()
++	now := time.Now()
++	uids := make([]string, 0, len(p.byUID))
++	for uid, e := range p.byUID {
++		if (realm == "" || e.a.Realm() == realm) && e.healthyForModel(now, model) && p.sgAllowed(e, model) {
++			uids = append(uids, uid)
++		}
++	}
++	sort.Strings(uids)
++	return uids
++}
++
++// AcquireStickyForModelRealm returns (nil,true) for a healthy busy account and
++// (nil,false) for an ineligible account. A nonnil result owns one request lease.
++func (p *Pool) AcquireStickyForModelRealm(uid, model, realm string) (*auth.Auth, bool) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	e, ok := p.byUID[uid]
++	now := time.Now()
++	if !ok || (realm != "" && e.a.Realm() != realm) || !e.healthyForModel(now, model) || !p.sgAllowed(e, model) {
++		return nil, false
++	}
++	limit := p.inFlightLimit(e)
++	for {
++		cur := e.inFlight.Load()
++		if limit > 0 && cur >= int64(limit) {
++			return nil, true
++		}
++		if e.inFlight.CompareAndSwap(cur, cur+1) {
++			break
++		}
++	}
++	e.lastUsed = now
++	p.pickSeq++
++	e.usedSeq = p.pickSeq
++	return e.a, true
++}
+diff --git a/internal/server/cachefix_busy_test.go b/internal/server/cachefix_busy_test.go
+new file mode 100644
+index 0000000..23006ec
+--- /dev/null
++++ b/internal/server/cachefix_busy_test.go
+@@ -0,0 +1,71 @@
++package server
++
++import (
++	"context"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/session"
++)
++
++func TestCacheFixBusyBindingAndRecovery(t *testing.T) {
++	for _, recover := range []bool{false, true} {
++		p := testPoolWith(&auth.Auth{UID: "busy", AccessToken: "token-busy", ExpiresAt: 9999999999}, &auth.Auth{UID: "other", AccessToken: "token-other", ExpiresAt: 9999999999})
++		p.SetMaxInFlight(1)
++		p.Acquire("busy")
++		sess := session.New(session.Config{Available: p.AvailableUIDs, EligibleForModel: func(m string) []string { return p.StickyEligibleUIDsForModelRealm(m, "cn") }})
++		sess.Bind("session-fixture", "busy")
++		calls := 0
++		up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++			calls++
++			if authz != "Bearer token-busy" {
++				t.Error("switched account while busy")
++			}
++			return 200, sseOK, true
++		})
++		h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, StickyWait: 80 * time.Millisecond})
++		if recover {
++			go func() { time.Sleep(10 * time.Millisecond); p.Release("busy") }()
++		}
++		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"deepseek-flash","messages":[],"metadata":{"session_id":"session-fixture"}}`))
++		rr := httptest.NewRecorder()
++		h.ServeHTTP(rr, req)
++		if recover {
++			if rr.Code != 200 || calls != 1 {
++				t.Fatalf("recovery code=%d calls=%d", rr.Code, calls)
++			}
++			if !p.Acquire("busy") {
++				t.Fatal("request lease leaked")
++			}
++			p.Release("busy")
++		} else {
++			if rr.Code != 429 || calls != 0 || rr.Header().Get("Retry-After") != "1" {
++				t.Fatalf("busy code=%d calls=%d", rr.Code, calls)
++			}
++			p.Release("busy")
++		}
++		uid, _ := sess.ResolveForModel("session-fixture", "deepseek-flash")
++		if uid != "busy" {
++			t.Fatalf("binding=%s want busy", uid)
++		}
++	}
++}
++
++func TestCacheFixCanceledWaitDoesNotAcquire(t *testing.T) {
++	p := testPoolWith(&auth.Auth{UID: "busy", AccessToken: "token", ExpiresAt: 9999999999})
++	p.SetMaxInFlight(1)
++	h := NewHandler(Config{Pool: p, StickyWait: time.Second})
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	acct, err := h.acquireSticky(ctx, "busy", "deepseek-flash", "cn")
++	if acct != nil || err != context.Canceled {
++		t.Fatalf("acct=%v err=%v", acct, err)
++	}
++	if !p.Acquire("busy") {
++		t.Fatal("canceled wait acquired a lease")
++	}
++	p.Release("busy")
++}
+diff --git a/internal/server/cachefix_compaction_test.go b/internal/server/cachefix_compaction_test.go
+new file mode 100644
+index 0000000..6525296
+--- /dev/null
++++ b/internal/server/cachefix_compaction_test.go
+@@ -0,0 +1,86 @@
++package server
++
++import (
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/session"
++	"workbuddy2api/internal/upstream"
++)
++
++func TestCacheFixSessionSurvivesCompaction(t *testing.T) {
++	for _, mode := range []string{"header", "metadata"} {
++		t.Run(mode, func(t *testing.T) {
++			p := testPoolWith(&auth.Auth{UID: "uid-a", AccessToken: "token-a", ExpiresAt: 9999999999}, &auth.Auth{UID: "uid-b", AccessToken: "token-b", ExpiresAt: 9999999999})
++			sess := session.New(session.Config{Available: p.AvailableUIDs})
++			var keys, accounts, convs []string
++			up := &upstream.Client{ChatBaseCN: "https://fixture.invalid", HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++				var body map[string]any
++				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++					t.Fatal(err)
++				}
++				keys = append(keys, body["prompt_cache_key"].(string))
++				accounts = append(accounts, r.Header.Get("Authorization"))
++				convs = append(convs, r.Header.Get("X-Conversation-ID"))
++				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(sseOK))}, nil
++			})}}
++			h := NewHandler(Config{Pool: p, Upstream: up, Session: sess})
++			for _, first := range []string{"original first user", "compacted summary"} {
++				body := map[string]any{"model": "deepseek-flash", "messages": []any{map[string]any{"role": "user", "content": first}}}
++				if mode == "metadata" {
++					body["metadata"] = map[string]any{"session_id": "session-fixture"}
++				}
++				raw, _ := json.Marshal(body)
++				req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(raw)))
++				if mode == "header" {
++					req.Header.Set("X-Session-ID", "session-fixture")
++				}
++				rr := httptest.NewRecorder()
++				h.ServeHTTP(rr, req)
++				if rr.Code != 200 {
++					t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
++				}
++			}
++			if len(keys) != 2 || keys[0] != keys[1] || accounts[0] != accounts[1] || convs[0] != "session-fixture" || convs[1] != "session-fixture" {
++				t.Fatalf("compaction drift: cache=%v account=%v conv=%v", keys, accounts, convs)
++			}
++			if sess.Count() != 1 {
++				t.Fatalf("bindings=%d want 1", sess.Count())
++			}
++		})
++	}
++}
++
++func TestCacheFixFallbackOnlyChangesCacheNamespace(t *testing.T) {
++	p := testPoolWith(&auth.Auth{UID: "uid-a", AccessToken: "token-a", ExpiresAt: 9999999999})
++	sess := session.New(session.Config{Available: p.AvailableUIDs})
++	var keys []string
++	up := &upstream.Client{ChatBaseCN: "https://fixture.invalid", HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++		if r.Header.Get("X-Conversation-ID") != "" {
++			t.Error("content fallback fabricated a conversation header")
++		}
++		var body map[string]any
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			t.Fatal(err)
++		}
++		keys = append(keys, body["prompt_cache_key"].(string))
++		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(sseOK))}, nil
++	})}}
++	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess})
++	for _, first := range []string{"session A first user", "session A first user", "session B first user"} {
++		body, _ := json.Marshal(map[string]any{"model": "deepseek-flash", "messages": []any{map[string]any{"role": "user", "content": first}}})
++		rr := httptest.NewRecorder()
++		h.ServeHTTP(rr, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(body))))
++		if rr.Code != 200 {
++			t.Fatalf("code=%d", rr.Code)
++		}
++	}
++	if keys[0] != keys[1] || keys[0] == keys[2] {
++		t.Fatalf("session cache namespaces=%v", keys)
++	}
++}
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index d2a860d..7fd0401 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -30,6 +30,8 @@ type Config struct {
+ 	MaxRotate int    // 单请求最多换号次数，默认 3
+ 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
+ 	Session *session.Router
++	// StickyWait: positive waits for a healthy bound account; zero keeps rotation.
++	StickyWait time.Duration
+ 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
+ 	StickyCount func() int
+ 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
+@@ -540,12 +542,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	tried := map[string]bool{}
+ 	var lastErr error
+ 
+-	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
++	// 会话粘性：先取稳定会话头，再取请求体的会话键并解析绑定号。
+ 	// 按模型解析：同一个会话可能换模型，绑定号若在当前模型上被 6004 限额（对其他模型
+ 	// 仍可用），必须重分配——否则会被钉在这个号上反复失败。
+ 	// 提取与下方会话头族的聚合键共用同一结果，故**不受粘性开关影响**：粘性未启用
+ 	// （Session==nil）时聚合键仍应是会话级，而不是退化成轮级。
+-	sessKey := session.ExtractKey(body)
++	sessKey := session.ExtractRequestKey(r.Header, body)
+ 	// stickyKey 是**粘性专用**键，与 sessKey（会话头族聚合用）分开：
+ 	// sessKey 为空时（OpenAI 兼容客户端——dsh / Codex 等既无 conversationId 也无
+ 	// metadata）用首条 user 消息派生会话级 fallback 键，使粘性仍能生效。
+@@ -653,6 +655,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	//       一次即共享。
+ 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
+ 	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
++	chatMeta.CacheConversationID = stickyKey
++	if sessKey != "" {
++		chatMeta.ConversationID = sessKey
++	}
+ 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
+ 		chatMeta.ConversationRequestID = v
+ 	} else if turnKey != "" && sessKey != "" {
+@@ -673,8 +679,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	for i := 0; i < h.cfg.MaxRotate; i++ {
+ 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
+ 		var acct *auth.Auth
++		alreadyAcquired := false
+ 		if stickyUID != "" {
+-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
++			if h.cfg.StickyWait > 0 {
++				var waitErr error
++				acct, waitErr = h.acquireSticky(r.Context(), stickyUID, bareModel, realm)
++				if waitErr != nil {
++					if errors.Is(waitErr, errStickyBusy) {
++						w.Header().Set("Retry-After", "1")
++						writeOpenAIError(w, http.StatusTooManyRequests, "sticky_account_busy", "session account is busy; retry this session")
++						st.status = http.StatusTooManyRequests
++					} else {
++						st.status = 499 // client canceled; no upstream request or lease
++					}
++					return
++				}
++				alreadyAcquired = acct != nil
++			} else {
++				acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
++			}
+ 			if acct == nil || (realm != "" && acct.Realm() != realm) {
+ 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑。
+ 				unbindSticky()
+@@ -695,7 +718,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 		tried[acct.UID] = true
+ 
+ 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
+-		if !h.cfg.Pool.Acquire(acct.UID) {
++		if !alreadyAcquired && !h.cfg.Pool.Acquire(acct.UID) {
+ 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
+ 			// 满载粘性号再浪费一次粘性命中往返（语义与 fail()/粘性命中-nil 的解绑一致）。
+ 			if stickyUID != "" && acct.UID == stickyUID {
+diff --git a/internal/server/sticky_wait.go b/internal/server/sticky_wait.go
+new file mode 100644
+index 0000000..6b2fd84
+--- /dev/null
++++ b/internal/server/sticky_wait.go
+@@ -0,0 +1,36 @@
++package server
++
++import (
++	"context"
++	"errors"
++	"time"
++
++	"workbuddy2api/internal/auth"
++)
++
++var errStickyBusy = errors.New("sticky account remains busy")
++
++// acquireSticky waits within a fixed budget and preserves the binding on busy
++// timeout. Account failure still permits the existing failover policy.
++func (h *Handler) acquireSticky(ctx context.Context, uid, model, realm string) (*auth.Auth, error) {
++	timer := time.NewTimer(h.cfg.StickyWait)
++	defer timer.Stop()
++	ticker := time.NewTicker(20 * time.Millisecond)
++	defer ticker.Stop()
++	for {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		acct, eligible := h.cfg.Pool.AcquireStickyForModelRealm(uid, model, realm)
++		if acct != nil || !eligible {
++			return acct, nil
++		}
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case <-timer.C:
++			return nil, errStickyBusy
++		case <-ticker.C:
++		}
++	}
++}
+diff --git a/internal/session/request_key.go b/internal/session/request_key.go
+new file mode 100644
+index 0000000..604b639
+--- /dev/null
++++ b/internal/session/request_key.go
+@@ -0,0 +1,29 @@
++package session
++
++import (
++	"encoding/json"
++	"net/http"
++	"strings"
++)
++
++// ExtractRequestKey accepts session IDs that survive history compaction.
++// Request/turn IDs, user IDs and system prompts are never session identities.
++func ExtractRequestKey(header http.Header, body []byte) string {
++	for _, name := range []string{"X-Session-ID", "X-Conversation-ID"} {
++		if v := strings.TrimSpace(header.Get(name)); v != "" && len(v) <= 256 {
++			return v
++		}
++	}
++	var obj map[string]any
++	if json.Unmarshal(body, &obj) == nil {
++		meta, _ := obj["metadata"].(map[string]any)
++		for _, container := range []map[string]any{meta, obj} {
++			for _, name := range []string{"session_id", "sessionId"} {
++				if v := strOrEmpty(container[name]); v != "" {
++					return v
++				}
++			}
++		}
++	}
++	return ExtractKey(body)
++}
+diff --git a/internal/session/session.go b/internal/session/session.go
+index 2e238fb..f9ebf7b 100644
+--- a/internal/session/session.go
++++ b/internal/session/session.go
+@@ -42,6 +42,9 @@ type Config struct {
+ 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
+ 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
+ 	AvailableForModel func(model string) []string
++	// EligibleForModel excludes failed/disabled accounts but retains busy ones.
++	// It validates existing bindings only; new assignments use AvailableForModel.
++	EligibleForModel func(model string) []string
+ }
+ 
+ // Router 会话粘性路由器。
+@@ -142,13 +145,20 @@ func (r *Router) LoadFromStore() {
+ func (r *Router) ResolveForModel(key, model string) (string, bool) {
+ 	now := time.Now()
+ 	available := r.availableSet(model)
++	eligible := available
++	if r.cfg.EligibleForModel != nil {
++		eligible = map[string]bool{}
++		for _, uid := range r.cfg.EligibleForModel(model) {
++			eligible[uid] = true
++		}
++	}
+ 
+ 	// ── Fast path: RLock 快查 ──────────────────────────────
+ 	r.mu.RLock()
+ 	e, found := r.entries[key]
+ 	r.mu.RUnlock()
+ 	if found && !expired(e, now, r.cfg.TTL) {
+-		if available[e.uid] {
++		if eligible[e.uid] {
+ 			r.touch(key, e.uid, now)
+ 			return e.uid, true
+ 		}
+@@ -161,7 +171,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
+ 
+ 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
+ 	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
+-		if available[e2.uid] {
++		if eligible[e2.uid] {
+ 			r.entries[key] = entry{uid: e2.uid, lastActive: now}
+ 			return e2.uid, true
+ 		}
+@@ -305,11 +315,11 @@ func hashIndex(key string, n int) int {
+ //  5. prompt_cache_key（第 5 项，见下）
+ //
+ // 前四项均为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
+-//（P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
++// （P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
+ // user 的全部并行对话会钉同一账号（粘性范围远大于上游 prompt cache 的对话级边界），
+ // 且曾抢占顶层 conversation_id 的优先级。剔除后发 user_id 的客户端回落加权轮换
+-//（与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
+-//（7d 兜底）自然过期，键消失不产生脏绑定。
++// （与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
++// （7d 兜底）自然过期，键消失不产生脏绑定。
+ //
+ // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
+ // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
+@@ -361,6 +371,8 @@ func ExtractKey(body []byte) string {
+ //
+ // 为什么取首条：会话内历史不断追加，但首条 user 消息在整段会话中恒定 → 同会话恒同键；
+ // 用户开新会话（首条消息不同）→ 自然换键。
++// compaction 删掉首条 user 后，此兜底键会改变；应由 ExtractRequestKey 接收
++// 客户端持续保留的会话 ID，不能靠重新哈希截断后的正文恢复原会话。
+ //
+ // 与 TurnKey 的区别（勿混用）：TurnKey 取**最后一条** user 消息，是**轮级**键，供上游
+ // 会话头族按"对话轮"聚合；本函数取**首条**，是**会话级**键，供粘性绑定长期复用。
+diff --git a/internal/upstream/cache_key.go b/internal/upstream/cache_key.go
+index 8fb4ea6..7763d3a 100644
+--- a/internal/upstream/cache_key.go
++++ b/internal/upstream/cache_key.go
+@@ -20,17 +20,17 @@ import (
+ //
+ // 优先级：
+ //  1. body 已带 prompt_cache_key → 原值保留（客户端自知复用哪个键）
+-//  2. body 已带 conversation_id / conversationId → 用它做会话哈希源
+-//  3. 都没有 → 用入站 conversationID 参数（来自 X-Conversation-ID 头解析）
++//  2. handler 已解析稳定会话源 → 用入站 conversationID 参数做会话哈希源
++//  3. 参数为空 → 用 body 的 conversation_id / conversationId
+ //
+ // 安全约束——按账号隔离：
+ //   - 生成键格式 `wb2a-<uid8>-<convHex>`
+-//   - uid8 是账号 UID 前 8 字符，跨账号绝不相同 → 跨账号缓存键绝不碰撞
+-//   - 跨账号复用同一 cache key 会让上游命中错账号的前缀缓存、泄露对方对话，故 uid 是硬隔离因子
++//   - uid8 仅供辨识；会话段的哈希包含完整 UID，保证不同账号使用不同命名空间
++//   - 相同的缓存键不会让不同账号共享上游缓存；上游仍按账号 UID 隔离
+ //
+ // 入参 uid 为账号 UID（空则用 "-"，但仍会注入键；调用方应保证传真实 UID）。
+-// 入参 conversationID 为网关解析出的会话标识（body 里没有 conversation_id 时用它做哈希源）。
+-// 两源都空时 convHex 为定值（每次新会话不复用前缀，但仍保留账号隔离段）。
++// 入参 conversationID 为网关解析出的稳定会话标识，账号粘性与缓存键共用这个源。
++// 两源都空时 convHex 由 UID 单独派生，同账号得到同一个键；是否命中仍取决于内容前缀。
+ // body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不二次错误化）。
+ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
+ 	if len(body) == 0 {
+@@ -44,12 +44,15 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
+ 	if existing, ok := obj["prompt_cache_key"].(string); ok && existing != "" {
+ 		return body
+ 	}
+-	// 优先级 2：body 里的 conversation_id / conversationId 做会话哈希源。
++	// 使用 handler 已解析的会话标识，使账号绑定与缓存键共享同一会话源。
++	// 独立调用时才回落 body 的 conversation_id / conversationId。
+ 	conv := conversationID
+-	if v := strField(obj, "conversation_id"); v != "" {
+-		conv = v
+-	} else if v := strField(obj, "conversationId"); v != "" {
+-		conv = v
++	if conv == "" {
++		if v := strField(obj, "conversation_id"); v != "" {
++			conv = v
++		} else if v := strField(obj, "conversationId"); v != "" {
++			conv = v
++		}
+ 	}
+ 	key := buildCacheKey(uid, conv)
+ 	obj["prompt_cache_key"] = key
+@@ -64,7 +67,7 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
+ //
+ // uid8 提供账号隔离段；convHex = sha256(uid + conversationID)[:16] 的 hex 提供会话段
+ // （同账号同会话稳定、不同会话不同）。会话源为空时 convHex 仍由 uid 单独哈希，
+-// 保证跨账号绝不碰撞但同一空会话不复用（空会话 = 新会话语义）。
++// 保持账号命名空间；同账号的空会话源会产生相同键。
+ func buildCacheKey(uid, conversation string) string {
+ 	uid8 := uid
+ 	if len(uid8) > 8 {
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index 9324f96..35da6f7 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -238,7 +238,7 @@ var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, pattern
+ //
+ // 只在 400/404/413 请求级状态码上判（429+11115 概率极低且属限流语义优先，
+ // 5xx 属服务端故障优先）——与 IsModelBlocked 的 400/404 口径同理。误判代价
+-//（好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
++// （好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
+ // 上游原文可自行排查，代价可控。
+ var promptTooLongRule = errorRule{kind: ErrPromptTooLong, mode: matchFold, patterns: []string{
+ 	`"code":11115`,
+@@ -291,7 +291,7 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
+ // 错误风暴（429 轰炸）时尤甚。模式串均为纯常量，与 sanitize.go 的包级
+ // 预编译先例保持一致。regexp 并发安全（匹配只读），无需额外锁。
+ var (
+-	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
++	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+ 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
+ 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
+ )
+@@ -814,7 +814,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
+ // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
+ // 显式传 realm 使 effort 降级按域取桶：CN 探测信息不得作用到 global 请求（C-2）。
+ // conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；
+-// body 里自带 conversation_id 时以 body 为准）。uid8 来自账号 UID，是跨账号硬隔离段。
++// handler 提供稳定会话源时以它为准；否则取 body 会话字段）。哈希包含完整账号 UID。
+ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
+ 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
+ 	if realmKey(realm) == "global" {
+@@ -1101,7 +1101,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 	// ensureConsoleSystem 在 prepareBody 后统一套用全局脚本：首条消息非 system 时前置
+ 	// 兜底 system（防 console 域上游 code 11-128；#119 后 global 出站固定 /v2，
+ 	// 该兜底保留——上游对 /v2 是否需要 system 无实测反证，删了无回滚路径）。
+-	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
++	cacheConversationID := meta.CacheConversationID
++	if cacheConversationID == "" {
++		cacheConversationID = meta.ConversationID
++	}
++	prepared := c.prepareBody(body, a.Realm(), a.UID, cacheConversationID)
+ 	if c.globalOn(a) {
+ 		prepared = ensureConsoleSystem(prepared)
+ 	}
+diff --git a/internal/upstream/headers.go b/internal/upstream/headers.go
+index 1fee48b..735fe92 100644
+--- a/internal/upstream/headers.go
++++ b/internal/upstream/headers.go
+@@ -207,6 +207,7 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
+ // 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
+ // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
+ type ChatMeta struct {
++	CacheConversationID   string // 缓存键的会话源；兜底哈希仅用于缓存，不冒充客户端会话头
+ 	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
+ 	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
+ 	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
+diff --git a/internal/upstream/sse.go b/internal/upstream/sse.go
+index 49410a0..e39c64c 100644
+--- a/internal/upstream/sse.go
++++ b/internal/upstream/sse.go
+@@ -262,7 +262,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
+ 		// completion_tokens（部分上游末帧缺 total），网关合成补齐——否则严格按
+ 		// schema 校验的客户端收不到 total_tokens。已有 total 或二者缺一不补
+ 		// （不臆造：单边有值无法合成可信的 total）。
+-		resp["usage"] = ensureUsageTotal(usage)
++		resp["usage"] = ensureUsageTotal(normalizeCacheUsage(usage))
+ 	}
+ 	return resp, nil
+ }
+@@ -455,6 +455,9 @@ func normalizeFrame(obj map[string]any) map[string]any {
+ 		out["choices"] = nchs
+ 	}
+ 	if u, ok := obj["usage"]; ok {
++		if usage, ok := u.(map[string]any); ok {
++			u = normalizeCacheUsage(usage)
++		}
+ 		out["usage"] = u
+ 	} else {
+ 		out["usage"] = nil
+diff --git a/internal/upstream/usage.go b/internal/upstream/usage.go
+new file mode 100644
+index 0000000..a45676c
+--- /dev/null
++++ b/internal/upstream/usage.go
+@@ -0,0 +1,42 @@
++package upstream
++
++// normalizeCacheUsage replaces a zero placeholder with an observed cache hit.
++// Both OpenAI's details and clients that prefer the top-level field see the hit.
++// Token totals and provider billing fields remain unchanged.
++func normalizeCacheUsage(u map[string]any) map[string]any {
++	if u == nil {
++		return nil
++	}
++	positive := func(v any) float64 {
++		n, ok := num64(v)
++		if !ok || n <= 0 {
++			return 0
++		}
++		return n
++	}
++	details, _ := u["prompt_tokens_details"].(map[string]any)
++	cached := positive(u["cached_tokens"])
++	if cached == 0 {
++		cached = positive(u["prompt_cache_hit_tokens"])
++	}
++	if cached == 0 {
++		cached = positive(details["cached_tokens"])
++	}
++	if cached == 0 {
++		return u
++	}
++	out := make(map[string]any, len(u)+2)
++	for k, v := range u {
++		out[k] = v
++	}
++	out["cached_tokens"] = cached
++	if positive(details["cached_tokens"]) == 0 {
++		d := make(map[string]any, len(details)+1)
++		for k, v := range details {
++			d[k] = v
++		}
++		d["cached_tokens"] = cached
++		out["prompt_tokens_details"] = d
++	}
++	return out
++}
+diff --git a/internal/upstream/usage_cache_compat_test.go b/internal/upstream/usage_cache_compat_test.go
+new file mode 100644
+index 0000000..229f225
+--- /dev/null
++++ b/internal/upstream/usage_cache_compat_test.go
+@@ -0,0 +1,75 @@
++package upstream
++
++import (
++	"encoding/json"
++	"net/http/httptest"
++	"reflect"
++	"strings"
++	"testing"
++	"testing/iotest"
++)
++
++func TestCacheFixClientUsage(t *testing.T) {
++	for _, tc := range []struct {
++		name, usage string
++		want        float64
++	}{
++		{"zero_masks_details", `{"prompt_tokens":700,"completion_tokens":1,"cached_tokens":0,"prompt_tokens_details":{"cached_tokens":640,"audio_tokens":3}}`, 640},
++		{"provider_hit_only", `{"prompt_tokens":200000,"completion_tokens":1,"cached_tokens":0,"prompt_cache_hit_tokens":192000,"prompt_cache_miss_tokens":8000,"credit":0.02}`, 192000},
++		{"standard_details", `{"prompt_tokens":700,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":640}}`, 640},
++		{"top_level_hit", `{"prompt_tokens":700,"completion_tokens":1,"cached_tokens":640}`, 640},
++		{"real_miss", `{"prompt_tokens":700,"completion_tokens":1,"cached_tokens":0,"prompt_tokens_details":{"cached_tokens":0}}`, 0},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			frame := `{"id":"chatcmpl-fixture","model":"deepseek-flash","choices":[],"usage":` + tc.usage + `}`
++			sse := "data: " + frame + "\r\n\r\ndata: [DONE]\r\n\r\n"
++			rr := httptest.NewRecorder()
++			if err := Stream(rr, iotest.OneByteReader(strings.NewReader(sse))); err != nil {
++				t.Fatal(err)
++			}
++			if strings.Count(rr.Body.String(), "data: [DONE]") != 1 {
++				t.Fatal("DONE count changed")
++			}
++			var out map[string]any
++			line := strings.Split(rr.Body.String(), "\n")[0]
++			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &out); err != nil {
++				t.Fatal(err)
++			}
++			u := out["usage"].(map[string]any)
++			// Mirrors the actual JS nullish-coalescing precedence at the client.
++			cached, exists := u["cached_tokens"]
++			if !exists || cached == nil {
++				cached = u["prompt_tokens_details"].(map[string]any)["cached_tokens"]
++			}
++			if cached != tc.want {
++				t.Fatalf("client inputCacheRead=%v want %v", cached, tc.want)
++			}
++			agg, err := Aggregate(iotest.OneByteReader(strings.NewReader(sse)))
++			if err != nil {
++				t.Fatal(err)
++			}
++			au := agg["usage"].(map[string]any)
++			if au["cached_tokens"] != tc.want {
++				t.Fatalf("aggregate cached=%v want %v", au["cached_tokens"], tc.want)
++			}
++			var original map[string]any
++			_ = json.Unmarshal([]byte(tc.usage), &original)
++			for _, field := range []string{"prompt_tokens", "completion_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens", "credit"} {
++				if !reflect.DeepEqual(original[field], u[field]) {
++					t.Fatalf("changed %s", field)
++				}
++			}
++		})
++	}
++}
++
++func TestCacheFixUsageDoesNotMutateInput(t *testing.T) {
++	var obj map[string]any
++	_ = json.Unmarshal([]byte(`{"usage":{"cached_tokens":0,"prompt_cache_hit_tokens":640,"prompt_tokens_details":{"audio_tokens":3}}}`), &obj)
++	before, _ := json.Marshal(obj)
++	_ = normalizeFrame(obj)
++	after, _ := json.Marshal(obj)
++	if string(before) != string(after) {
++		t.Fatal("upstream usage mutated")
++	}
++}
