@@ -4,5 +4,5 @@
 维护者留存并继续维护。许可为 MIT（见 LICENSE，版权归原作者）——再分发请保留
 LICENSE 与版权声明。
 
-打包说明：模型清单补 Magpie 兼容字段：modalities.input 含 image、supported_reasoning_levels（issue #156，只增不改）；另含工具结果配对与 11148 请求级返回（#154）、环境变量代理（#136）、脚本 UTF-8（#147）
-打包时间：2026-10-10 19:12:40
+打包说明：Add cooldown.credit_exhausted: shorten credit-exhausted cooldown instead of cooling until 04:00
+打包时间：2026-10-15 23:02:32
