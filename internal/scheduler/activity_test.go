@@ -488,11 +488,10 @@ func TestRunCheckinDoesNotTriggerTravel(t *testing.T) {
 // TestNextWakeTravelIndependent 旅行有独立时点，与签到互不影响。
 func TestNextWakeTravelIndependent(t *testing.T) {
 	s := New(Config{
-		CheckinHours:    []int{21},
-		TravelHours:     []int{9},
-		ActivityHours:   []int{10},
-		KeepaliveHours:  []int{22},
-		BillingDisabled: true,
+		CheckinHours:   []int{21},
+		TravelHours:    []int{9},
+		ActivityHours:  []int{10},
+		KeepaliveHours: []int{22},
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 8, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 9, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -506,11 +505,10 @@ func TestNextWakeTravelIndependent(t *testing.T) {
 // TestNextWakeActivityIndependent 活跃上报有独立时点。
 func TestNextWakeActivityIndependent(t *testing.T) {
 	s := New(Config{
-		CheckinHours:    []int{21},
-		TravelHours:     []int{9},
-		ActivityHours:   []int{10},
-		KeepaliveHours:  []int{22},
-		BillingDisabled: true,
+		CheckinHours:   []int{21},
+		TravelHours:    []int{9},
+		ActivityHours:  []int{10},
+		KeepaliveHours: []int{22},
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 9, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 10, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -524,11 +522,10 @@ func TestNextWakeActivityIndependent(t *testing.T) {
 // TestNextWakeTravelDisabled 旅行禁用后排程里不再有旅行时点（签到照常）。
 func TestNextWakeTravelDisabled(t *testing.T) {
 	s := New(Config{
-		CheckinHours:    []int{9, 21},
-		TravelHours:     []int{9},
-		TravelDisabled:  true,
-		KeepaliveHours:  []int{22},
-		BillingDisabled: true,
+		CheckinHours:   []int{9, 21},
+		TravelHours:    []int{9},
+		TravelDisabled: true,
+		KeepaliveHours: []int{22},
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 8, 0, 0, 0, time.Local))
 	// 旅行禁用 → 09:00 旅行时点不应出现，最近的是 09:00 签到（同小时但签到未禁用）。
@@ -552,7 +549,6 @@ func TestNextWakeActivityDisabled(t *testing.T) {
 		KeepaliveHours:   []int{22},
 		SchoolDisabled:   true,
 		CatDisabled:      true,
-		BillingDisabled:  true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 9, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -571,7 +567,6 @@ func TestCheckinDisabledTravelStillRuns(t *testing.T) {
 		TravelHours:     []int{9},
 		ActivityHours:   []int{10},
 		KeepaliveHours:  []int{22},
-		BillingDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 8, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 9, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -594,7 +589,6 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
 		KeepaliveDisabled: true,
 		SchoolDisabled:    true,
 		CatDisabled:       true,
-		BillingDisabled:   true,
 		CheckinHours:      []int{9, 21},
 		TravelHours:       []int{9},
 		ActivityHours:     []int{10},
@@ -609,11 +603,10 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
 // TestNextWakeSameHourTravelAndCheckin 旅行与签到配到同一小时时两类任务都要执行。
 func TestNextWakeSameHourTravelAndCheckin(t *testing.T) {
 	s := New(Config{
-		CheckinHours:    []int{9, 21},
-		TravelHours:     []int{9},
-		ActivityHours:   []int{10},
-		KeepaliveHours:  []int{22},
-		BillingDisabled: true,
+		CheckinHours:   []int{9, 21},
+		TravelHours:    []int{9},
+		ActivityHours:  []int{10},
+		KeepaliveHours: []int{22},
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 8, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 9, 0, 0, 0, time.Local); !at.Equal(want) {

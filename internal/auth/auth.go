@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,17 +32,72 @@ type Auth struct {
 	//
 	// 命名注记：Go 不允许字段与方法同名，持久化字段用未导出 realm，计算访问器用
 	// 导出的 Realm()（跨包调用全部走方法）。Parse/SaveAtomic/login 在包内读写字段。
-	realm          string
-	UID            string
-	EnterpriseID   string
-	Nickname       string
-	FilePath       string // 来源文件；refresh 后原子写回此处
+	realm        string
+	UID          string
+	EnterpriseID string
+	Nickname     string
+	FilePath     string // 来源文件；refresh 后原子写回此处
 
+	// ProxyName 账号级出口线路**名**（不是地址），来源 auth 文件顶层 `proxy` 字段，
+	// 由面板的「出口线路」功能写入；线路名 → 代理地址的映射在上游 config.json 的
+	// `proxies` 里。空 = 跟随进程级代理（WB_HTTP_PROXY / 环境变量）。
+	//
+	// 为什么存在这个字段：面板早就能给账号绑线路，但上游此前完全不读它 —— 于是
+	// 「每个号一条出口」只是界面上看起来生效，真正的对话流量还是全池共用宿主出口
+	// （多号同 IP 容易被平台关联）。现在上游按它选 transport（见 upstream.TransportFor）。
+	ProxyName string
 	// DeviceToken 设备风控 Token（X-Device-Token 头），来源 auth 文件的 device_token 键。
 	// 缺省为空 = 不注入该头（容器内无桌面端 Turing SDK 的常见部署）。
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// Weight 账号级手写权重（issue #187），来源 auth 文件顶层 `weight` 字段，
+	// 由面板的「权重」写入。0 = 未设置（等价 1.0）。
+	//
+	// 语义是**乘数**而非优先级：选号本来就按「余额 + 快过期占比 + 闲置时长」
+	// 三因子加权随机（见 pool.weightOf），这里把结果再乘上该值 —— 权重 3 表示
+	// 同等条件下被抽中的机会约为默认的 3 倍。之所以不做成「权重高的恒定优先」：
+	// 那会让低权重的号一直闲置，积分用不完就过期（正是 #187 另一半诉求要避免的）。
+	// 硬门槛（冷却 / 熔断 / 禁用 / 在途占满）与成本分层不受本字段影响。
+	Weight float64
+}
+
+// 手写权重的取值区间：低于 MinWeight 等于「几乎不用」（但仍留一丝机会，与
+// pickWeighted 的权重保底 ≥1 同口径），高于 MaxWeight 没有实际意义。
+const (
+	MinWeight = 0.1
+	MaxWeight = 100.0
+)
+
+// PickWeight 返回用于选号的权重乘数：未设置（0）或非法值给 1，合法值钳制在
+// [MinWeight, MaxWeight]。选号侧只读本方法、不直读字段 —— 钳制口径只有一处，
+// 否则「文件里写了 1e9」这种输入会把选号直接压成一号独大。
+func (a *Auth) PickWeight() float64 {
+	w := a.Weight
+	if math.IsNaN(w) || math.IsInf(w, 0) || w <= 0 {
+		return 1
+	}
+	if w < MinWeight {
+		return MinWeight
+	}
+	if w > MaxWeight {
+		return MaxWeight
+	}
+	return w
+}
+
+// sanitizeWeight 解析期清洗：非有限值与负数一律当「未设置」（0）。合法但越界的
+// 值**保留原样**，由 PickWeight 在选号时钳制 —— 面板靠原值回显「用户填了什么」，
+// 这里改写会让界面显示与文件内容不一致。手改坏的值打一行 WARN，否则「权重没生效」
+// 会变成没有线索的悬案。
+func sanitizeWeight(w float64) float64 {
+	if math.IsNaN(w) || math.IsInf(w, 0) || w < 0 {
+		log.Printf("WARN: [auth] 忽略非法的 weight=%v（按未设置处理，应为 %v..%v）",
+			w, MinWeight, MaxWeight)
+		return 0
+	}
+	return w
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -230,6 +286,10 @@ func Parse(raw []byte) (*Auth, error) {
 			// DeviceToken 顶层 device_token（嵌套形与扁平形共用）。
 			// 放在 auth 段之外，手写时无需嵌进 auth 对象，降低配置门槛。
 			DeviceToken string `json:"device_token"`
+			// Proxy 顶层 proxy（线路名，面板写入；见 Auth.ProxyName）。
+			Proxy string `json:"proxy"`
+			// Weight 顶层 weight（手写权重，面板写入；见 Auth.Weight）。
+			Weight float64 `json:"weight"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -244,6 +304,8 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
 			DeviceToken:  n.DeviceToken,
+			ProxyName:    strings.TrimSpace(n.Proxy),
+			Weight:       sanitizeWeight(n.Weight),
 		}
 	} else {
 		var f struct {
@@ -256,6 +318,12 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
 			DeviceToken  string `json:"device_token"`
+			Proxy        string `json:"proxy"`
+
+			// Weight 顶层 weight（与 proxy 同层级，面板写入；见 Auth.Weight）。
+			// 单独成组（上方空行）是为了不改动既有字段的对齐 —— 补丁切片只描述
+			// 自己的增量，gofmt 顺手重排别人的行会让前一个补丁的「已应用」判定失效。
+			Weight float64 `json:"weight"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -270,6 +338,8 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
 			DeviceToken:  f.DeviceToken,
+			ProxyName:    strings.TrimSpace(f.Proxy),
+			Weight:       sanitizeWeight(f.Weight),
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -308,6 +378,18 @@ func (a *Auth) SaveAtomic() error {
 	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
 	if a.DeviceToken != "" {
 		doc["device_token"] = a.DeviceToken
+	}
+	// ProxyName 同理非空才写回：**刷新 token 会整份重建文件**，不保留就等于把面板
+	// 绑好的出口线路静默解绑（出口随之改变，而这类变化没人会发现）。空值不写，
+	// 避免在没绑线路的文件里引入空键。
+	if a.ProxyName != "" {
+		doc["proxy"] = a.ProxyName
+	}
+	// Weight 同理只在非零时写回（issue #187）：刷新 token 会整份重建文件，
+	// 不保留等于把用户设的权重静默清零。0 = 未设置，不写键（面板把 1 当默认，
+	// 手改过的文件也不会因此多出 weight: 1 这种噪音）。
+	if a.Weight != 0 {
+		doc["weight"] = a.Weight
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

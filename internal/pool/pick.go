@@ -58,13 +58,6 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if !healthyOf(e) {
 			continue
 		}
-		// SG 积分闸门（gate.go）：闸门模型 + 目标 realm 的账号若被摘除，不进候选。
-		// 恒真路径（闸门未启用/模型不匹配）零开销，且**不**影响其余模型的候选集
-		// ——这正是"付费池缩到 3 个而免费池仍是 5 个"的实现点：闸门只作用于
-		// reqModel == sgGateModel 这一次选号，别的模型走的是另一条 pick 调用。
-		if !p.sgAllowed(e, reqModel) {
-			continue
-		}
 		if p.inFlightFull(e) {
 			continue // 在途占满：跳过（max=0 不限时不触发）
 		}
@@ -73,7 +66,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
+		return p.pickEarliestExpiryLocked(tried, now, realm)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿
 	// 根本进不了短名单决策，低 credits 但久置的账号会永远排不进 top5。
@@ -236,15 +229,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-//
-// reqModel 参与两条**模型级**排除（此前本兜底完全不看模型，导致两处泄漏）：
-//  1. SG 积分闸门（gate.go）：被摘除的账号在兜底里同样不得被选中——否则 normal
-//     阶段被正确摘掉的号会在"全池冷却"时从兜底路径漏回去打付费模型，闸门形同虚设。
-//  2. 6004 模型级冷却（modelCooled）：账号对该模型仍在限额内时不该被兜底选中。
-//     这是既有实现的固有漏洞（normal 走 healthyForModel，兜底只判账号级 until）：
-//     被 6004 限额的号账号级仍健康，一旦其余号都在冷却，兜底就会把它选出来再撞一次 429。
-//     两条都是"有 reqModel 时才生效"，空模型（老 Pick 语义）行为逐字不变。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, reqModel string) *auth.Auth {
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -255,12 +240,6 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 		if e.disabled || e.manualDisabled {
 			continue // 禁用/手动停用的账号永不参与兜底
-		}
-		if !p.sgAllowed(e, reqModel) {
-			continue // SG 闸门：被摘除的号不参与本模型的兜底
-		}
-		if e.modelCooled(now, reqModel) {
-			continue // 6004/11102 模型级冷却：该模型对此号仍不可用
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
@@ -323,12 +302,15 @@ const expiringWeight = 8.0
 
 // pickWeighted 三因子加权随机（claude-api selectWeightedRandom 参考口径）：
 //
-//		weight = credits 比例 × 10 + 快过期积分占比 × expiringWeight + idleWeight
+//	weight = (credits 比例 × 10 + 快过期积分占比 × expiringWeight + idleWeight) × 手写权重
 //
-//	  - credits 比例 = 该号 credits / 全集最大 credits（避免量纲爆炸；全集口径：
-//	    tier 过滤前的全部 healthy 候选，与截断排序共享基准——见 weighted 预计算注释）
-//	  - 快过期积分占比 = creditsExpiring/credits（×8，issue:积分过期）
-//	  - idleWeight = min(距 lastUsed 小时数 × idleWeightPerHour, idleWeightMax)；从未使用给满分
+// 最后一项即 auth.Auth.PickWeight（面板「权重」，默认 1 = 与改造前逐位一致，
+// issue #187）；它只缩放抽签权重，不改变候选资格。
+//
+//   - credits 比例 = 该号 credits / 全集最大 credits（避免量纲爆炸；全集口径：
+//     tier 过滤前的全部 healthy 候选，与截断排序共享基准——见 weighted 预计算注释）
+//   - 快过期积分占比 = creditsExpiring/credits（×8，issue:积分过期）
+//   - idleWeight = min(距 lastUsed 小时数 × idleWeightPerHour, idleWeightMax)；从未使用给满分
 //
 // credits 全 0 时仍按 idle+expiring 加权（不退化均匀随机）。
 // 权重为浮点，用 int64 定点（×1e6）抽签可保持确定性随机源注入（randInt64N 语义不变）。
@@ -409,5 +391,11 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	// （原第 3 因子「成功率 EMA ×3」已删，success-ema-review §4：双饱和计数器对
 	// 真实成功率不敏感、成熟池退化为与默认值重合的常数 1.5、失败侧与熔断器
 	// 100% 同源——机制名存实亡且冗余，删除后 weightOf 为三因子。）
+	//
+	// 4. 手写权重乘数（issue #187）：面板给该号设的权重，未设置 = 1（分布与改造前
+	// 逐位一致）。放在**最后乘**而不是压平上面三项：三因子决定「同条件谁更强」，
+	// 权重只放大/缩小这个结论。硬门槛（healthy / 在途 / 成本分层）在本函数之前
+	// 已经过滤完，所以调大权重也不能把冷却号或已实测收费的号塞进候选。
+	w *= e.a.PickWeight()
 	return w
 }

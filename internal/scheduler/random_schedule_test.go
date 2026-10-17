@@ -102,7 +102,6 @@ func jitterScheduler(minutes int) *Scheduler {
 		RandomDelayMinutes: minutes, RandomDelaySeed: "synthetic-deployment",
 		CheckinHours: []int{9}, TravelDisabled: true, ActivityDisabled: true,
 		KeepaliveDisabled: true, SchoolDisabled: true, CatDisabled: true,
-		BillingDisabled: true,
 	})
 }
 

@@ -56,7 +56,6 @@ func TestNextWakeSchoolSlot(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
-		BillingDisabled:   true,
 		SchoolHours:       []int{12},
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 14, 11, 0, 0, 0, time.Local))
@@ -75,7 +74,6 @@ func TestNextWakeCatSlot(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
-		BillingDisabled:   true,
 		CatHours:          []int{1},
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 14, 23, 0, 0, 0, time.Local))
@@ -98,7 +96,6 @@ func TestNextWakeSchoolCatDisabled(t *testing.T) {
 		CatHours:          []int{1},
 		SchoolDisabled:    true,
 		CatDisabled:       true,
-		BillingDisabled:   true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 14, 8, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 14, 21, 0, 0, 0, time.Local); !at.Equal(want) {

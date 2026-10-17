@@ -15,7 +15,7 @@ func (p *Pool) StickyEligibleUIDsForModelRealm(model, realm string) []string {
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
-		if (realm == "" || e.a.Realm() == realm) && e.healthyForModel(now, model) && p.sgAllowed(e, model) {
+		if (realm == "" || e.a.Realm() == realm) && e.healthyForModel(now, model) {
 			uids = append(uids, uid)
 		}
 	}
@@ -30,7 +30,7 @@ func (p *Pool) AcquireStickyForModelRealm(uid, model, realm string) (*auth.Auth,
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
 	now := time.Now()
-	if !ok || (realm != "" && e.a.Realm() != realm) || !e.healthyForModel(now, model) || !p.sgAllowed(e, model) {
+	if !ok || (realm != "" && e.a.Realm() != realm) || !e.healthyForModel(now, model) {
 		return nil, false
 	}
 	limit := p.inFlightLimit(e)
