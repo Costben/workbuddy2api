@@ -59,16 +59,14 @@ func TestCacheFixSessionSurvivesCompaction(t *testing.T) {
 func TestCacheFixFallbackOnlyChangesCacheNamespace(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "uid-a", AccessToken: "token-a", ExpiresAt: 9999999999})
 	sess := session.New(session.Config{Available: p.AvailableUIDs})
-	var keys []string
+	var keys, convs []string
 	up := &upstream.Client{ChatBaseCN: "https://fixture.invalid", HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.Header.Get("X-Conversation-ID") != "" {
-			t.Error("content fallback fabricated a conversation header")
-		}
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
 		keys = append(keys, body["prompt_cache_key"].(string))
+		convs = append(convs, r.Header.Get("X-Conversation-ID"))
 		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(sseOK))}, nil
 	})}}
 	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess})
@@ -82,5 +80,10 @@ func TestCacheFixFallbackOnlyChangesCacheNamespace(t *testing.T) {
 	}
 	if keys[0] != keys[1] || keys[0] == keys[2] {
 		t.Fatalf("session cache namespaces=%v", keys)
+	}
+	// 内容兜底只改缓存命名空间：会话头由上游 ConversationIDForHeaders 派生（issue #193），
+	// 不能被本兜底键顶替。断言它与兜底同样保持「同会话稳定、跨会话不同」。
+	if convs[0] != convs[1] || convs[0] == convs[2] {
+		t.Fatalf("conversation headers=%v", convs)
 	}
 }
