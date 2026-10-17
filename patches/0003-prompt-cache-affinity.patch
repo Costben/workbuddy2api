@@ -1,8 +1,8 @@
 diff --git a/cmd/server/config.go b/cmd/server/config.go
-index 9c85349..3c821ba 100644
+index 0d570df..bd20d66 100644
 --- a/cmd/server/config.go
 +++ b/cmd/server/config.go
-@@ -161,9 +161,10 @@ type Config struct {
+@@ -153,9 +153,10 @@ type Config struct {
  	} `json:"pool"`
  
  	SessionSticky struct {
@@ -16,7 +16,7 @@ index 9c85349..3c821ba 100644
  	} `json:"session_sticky"`
  
  	// 解析后
-@@ -176,6 +177,7 @@ type Config struct {
+@@ -168,6 +169,7 @@ type Config struct {
  	DegradeCooldownMaxD time.Duration `json:"-"`
  	SessionTTL          time.Duration `json:"-"`
  	SessionGCInterval   time.Duration `json:"-"`
@@ -24,7 +24,7 @@ index 9c85349..3c821ba 100644
  	ExpiringSoonDur     time.Duration `json:"-"`
  	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
  	CostExploreIntervalDur time.Duration `json:"-"`
-@@ -239,6 +241,7 @@ func Default() *Config {
+@@ -219,6 +221,7 @@ func Default() *Config {
  	c.SessionSticky.Enabled = true
  	c.SessionSticky.TTL = "30m"
  	c.SessionSticky.GCInterval = "5m"
@@ -32,7 +32,7 @@ index 9c85349..3c821ba 100644
  	return c
  }
  
-@@ -386,6 +389,12 @@ func (c *Config) normalize() error {
+@@ -400,6 +403,12 @@ func (c *Config) normalize() error {
  	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
  		return fmt.Errorf("session_sticky.gc_interval: %w", err)
  	}
@@ -46,10 +46,10 @@ index 9c85349..3c821ba 100644
  		c.Pool.BreakerThreshold = 3
  	}
 diff --git a/cmd/server/main.go b/cmd/server/main.go
-index 45b42e9..408dda5 100644
+index ca5a055..5576353 100644
 --- a/cmd/server/main.go
 +++ b/cmd/server/main.go
-@@ -108,6 +108,7 @@ func main() {
+@@ -113,6 +113,7 @@ func main() {
  			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏，
  			// 见 wiring.go）；裸名走 cn（现状零回归）。
  			AvailableForModel: realmAwareAvailableForModel(p),
@@ -57,7 +57,7 @@ index 45b42e9..408dda5 100644
  		})
  		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
  		sessRouter.StartGC()
-@@ -231,6 +232,7 @@ func main() {
+@@ -221,6 +222,7 @@ func main() {
  		Upstream:     up,
  		APIKey:       cfg.APIKey,
  		Session:      sessRouter,
@@ -109,7 +109,7 @@ index 9e0ba20..b35660a 100644
  }
 diff --git a/internal/pool/sticky.go b/internal/pool/sticky.go
 new file mode 100644
-index 0000000..5129427
+index 0000000..e91817a
 --- /dev/null
 +++ b/internal/pool/sticky.go
 @@ -0,0 +1,50 @@
@@ -130,7 +130,7 @@ index 0000000..5129427
 +	now := time.Now()
 +	uids := make([]string, 0, len(p.byUID))
 +	for uid, e := range p.byUID {
-+		if (realm == "" || e.a.Realm() == realm) && e.healthyForModel(now, model) && p.sgAllowed(e, model) {
++		if (realm == "" || e.a.Realm() == realm) && e.healthyForModel(now, model) {
 +			uids = append(uids, uid)
 +		}
 +	}
@@ -145,7 +145,7 @@ index 0000000..5129427
 +	defer p.mu.Unlock()
 +	e, ok := p.byUID[uid]
 +	now := time.Now()
-+	if !ok || (realm != "" && e.a.Realm() != realm) || !e.healthyForModel(now, model) || !p.sgAllowed(e, model) {
++	if !ok || (realm != "" && e.a.Realm() != realm) || !e.healthyForModel(now, model) {
 +		return nil, false
 +	}
 +	limit := p.inFlightLimit(e)
@@ -336,7 +336,7 @@ index 0000000..5714ef8
 +	}
 +}
 diff --git a/internal/server/handler.go b/internal/server/handler.go
-index 54619b1..be40ec8 100644
+index 311c1bc..073d8fa 100644
 --- a/internal/server/handler.go
 +++ b/internal/server/handler.go
 @@ -31,6 +31,8 @@ type Config struct {
@@ -615,10 +615,10 @@ index 8fb4ea6..7763d3a 100644
  	uid8 := uid
  	if len(uid8) > 8 {
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index 9a267ea..fed9255 100644
+index 4c1ccc6..e1076da 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
-@@ -846,7 +846,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
+@@ -907,7 +907,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
  // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
  // 显式传 realm 使 effort 降级按域取桶：CN 探测信息不得作用到 global 请求（C-2）。
  // conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；
@@ -627,7 +627,7 @@ index 9a267ea..fed9255 100644
  func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
  	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
  	if realmKey(realm) == "global" {
-@@ -1154,7 +1154,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+@@ -1220,7 +1220,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
  	// ensureConsoleSystem 在 prepareBody 后统一套用全局脚本：首条消息非 system 时前置
  	// 兜底 system（防 console 域上游 code 11-128；#119 后 global 出站固定 /v2，
  	// 该兜底保留——上游对 /v2 是否需要 system 无实测反证，删了无回滚路径）。
