@@ -483,6 +483,16 @@ const (
 	modelBlockShift   = 6 // 2^6=64 倍后封顶：6h×64>24h，实际封顶锚定 24h
 )
 
+// 14003「too many requests / Model busy」的模型级短退避参数。
+// 上游文案明确让客户端「switch models or retry later」，属于模型维度繁忙，不是账号被封；
+// 因此只锁触发模型（复用 modelCooldowns），60s 起、指数退避、封顶 10 分钟，
+// 该模型成功一次即清。免费 flash 被 14003 时，SG 等其它模型仍可继续服务。
+const (
+	modelBusyBaseTTL = time.Minute
+	modelBusyMaxTTL  = 10 * time.Minute
+	modelBusyShift   = 4 // 1m→2m→4m→8m→10m（封顶）
+)
+
 // sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。
 // 12153 会被临时性触发（网络抖动/上游闪断/refresh 竞态），一次失败即禁用的旧行为
 // 会误杀健康账号（P0-1：13 个 disabled 号全是误判）。3 次连续才判死：容忍偶发抖动，

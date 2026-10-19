@@ -338,6 +338,28 @@ func IsModelRateLimit(body string) bool {
 	return reModelRateLimit.MatchString(body)
 }
 
+// modelBusyCode 明确指向「模型繁忙」的业务 code。上游 14003 的文案是
+// "too many requests" + displayMsg "Model busy. Please switch models or retry later"，
+// 属于模型维度繁忙，不是账号整体被封；旧实现按账号级冷却会把 SG 等其它模型一起封死。
+const modelBusyCode = "14003"
+
+// ModelBusyReason 14003 模型级短退避在 pool.modelCooldowns 里的 reason 值。
+const ModelBusyReason = "14003 model busy"
+
+var (
+	reModelBusy    = regexp.MustCompile(`"code"\s*:\s*"?` + modelBusyCode + `"?`)
+	reModelBusyMsg = regexp.MustCompile(`(?i)model busy|模型繁忙`)
+)
+
+// IsModelBusy 报告 429 body 是否明确指向模型级繁忙（业务 code 14003，或上游固定文案
+// "Model busy" / "模型繁忙"）。命中后只锁触发模型，其它模型（如 -sg）保持可用。
+func IsModelBusy(body string) bool {
+	if body == "" {
+		return false
+	}
+	return reModelBusy.MatchString(body) || reModelBusyMsg.MatchString(body)
+}
+
 // modelBlockCode 明确指向「该后端无此模型」的业务 code（reference converter.MODEL_NOT_SERVABLE_CODES）。
 const modelBlockCode = "11102"
 

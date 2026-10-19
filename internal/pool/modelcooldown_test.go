@@ -754,6 +754,82 @@ func TestBlockModelClear6004NotClearedByPrefix(t *testing.T) {
 	}
 }
 
+// TestCooldownSoftForModelBackoffScopesToModel 14003「Model busy」只锁触发模型：
+// 账号级 until 保持零值，免费 flash 被锁时 SG 仍 healthyForModel=true。
+func TestCooldownSoftForModelBackoffScopesToModel(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModelBackoff("u1", "deepseek-v4.1-flash", time.Minute, "14003 model busy")
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("u1 missing")
+	}
+	if !st.Until.IsZero() {
+		t.Errorf("14003 不得写账号级 until，got %v", st.Until)
+	}
+	if st.Cooling {
+		t.Errorf("14003 是模型级繁忙，账号本身不应被标记 cooling: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "deepseek-v4.1-flash" {
+		t.Fatalf("应只有免费 flash 的模型级台账: %+v", st.RateLimitedModels)
+	}
+
+	now := time.Now()
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	flashOK := e.healthyForModel(now, "deepseek-v4.1-flash")
+	sgOK := e.healthyForModel(now, "deepseek-v4.1-flash-sg")
+	p.mu.RUnlock()
+	if flashOK {
+		t.Errorf("触发 14003 的免费 flash 应被锁")
+	}
+	if !sgOK {
+		t.Errorf("SG 是独立模型，不应被免费 flash 的 14003 连坐")
+	}
+}
+
+// TestCooldownSoftForModelBackoffNoExtend 已在冷却中的兜底探测不延长 TTL、不推进 Hits。
+func TestCooldownSoftForModelBackoffNoExtend(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModelBackoff("u1", "m", time.Minute, "14003 model busy")
+	p.mu.RLock()
+	first := p.byUID["u1"].modelCooldowns["m"]
+	p.mu.RUnlock()
+
+	p.CooldownSoftForModelBackoff("u1", "m", time.Minute, "14003 model busy")
+	p.mu.RLock()
+	second := p.byUID["u1"].modelCooldowns["m"]
+	p.mu.RUnlock()
+	if second.Hits != first.Hits {
+		t.Errorf("冷却中重复命中不应推进 Hits: %d -> %d", first.Hits, second.Hits)
+	}
+	if d := second.Until.Sub(first.Until); d > time.Second || d < -time.Second {
+		t.Errorf("冷却中重复命中不应延长 Until: %v -> %v", first.Until, second.Until)
+	}
+}
+
+// TestBlockModelClearClears14003 成功路径清 14003 短退避，但不碰 6004。
+func TestBlockModelClearClears14003(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownSoftForModelBackoff("u1", "deepseek-v4.1-flash", time.Minute, "14003 model busy")
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(30*time.Minute), "glm-5.3", "6004 model rate limit")
+
+	p.BlockModelClear("u1", "deepseek-v4.1-flash")
+	p.mu.RLock()
+	_, busyGone := p.byUID["u1"].modelCooldowns["deepseek-v4.1-flash"]
+	_, sixGone := p.byUID["u1"].modelCooldowns["glm-5.3"]
+	p.mu.RUnlock()
+	if busyGone {
+		t.Errorf("BlockModelClear 后 14003 条目应清除")
+	}
+	if !sixGone {
+		t.Errorf("BlockModelClear 不得清除 6004 条目")
+	}
+}
+
 // TestBlockModelBackoffPickSkips 11102 后选号器对该账号该模型避开（Pick 对 glm 豁免 u1 恢复）。
 func TestBlockModelBackoffPickSkips(t *testing.T) {
 	withNoPickGap(t)

@@ -148,7 +148,7 @@ func TestIsWafBlocked(t *testing.T) {
 	}{
 		{403, "", true},
 		{403, "<html>blocked</html>", true},
-		{403, `{"code":1}`, false},               // 有 "code": 字段
+		{403, `{"code":1}`, false},                // 有 "code": 字段
 		{403, `{"msg":"request illegal"}`, false}, // 有 "msg": 字段（且该文案本就该走 accountFault）
 		{402, "", false},                          // 非 403
 		{429, "", false},
@@ -301,6 +301,31 @@ func TestIsModelRateLimit(t *testing.T) {
 	for _, c := range cases {
 		if got := IsModelRateLimit(c.body); got != c.want {
 			t.Errorf("IsModelRateLimit(%q)=%v want %v", c.body, got, c.want)
+		}
+	}
+}
+
+// TestIsModelBusy 14003「Model busy」判定：只认 code 14003 或上游固定文案，
+// 用于把「模型繁忙」从账号级 429 中拆出来（免费 flash 繁忙时 SG 仍可用）。
+func TestIsModelBusy(t *testing.T) {
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{`{"code":14003,"msg":"too many requests","displayMsg":{"en":"Model busy. Please switch models or retry later","zh":"模型繁忙，请换模型或稍后重试"}}`, true},
+		{`{"code": 14003,"msg":"x"}`, true},
+		{`{"code":"14003","msg":"x"}`, true},
+		{`{"msg":"Model busy. Please switch models or retry later"}`, true},
+		{`{"msg":"模型繁忙，请换模型或稍后重试"}`, true},
+		// 账号级限流不得误判为模型繁忙。
+		{`{"code":11140,"msg":"The model provider is rate-limiting requests."}`, false},
+		{`{"code":6004,"msg":"usage exceeds frequency limit"}`, false},
+		{`{"code":1,"msg":"429 rate limit"}`, false},
+		{``, false},
+	}
+	for _, c := range cases {
+		if got := IsModelBusy(c.body); got != c.want {
+			t.Errorf("IsModelBusy(%q)=%v want %v", c.body, got, c.want)
 		}
 	}
 }

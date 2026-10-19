@@ -1,0 +1,446 @@
+diff --git a/internal/pool/cooldown.go b/internal/pool/cooldown.go
+index df0ed43..647c33d 100644
+--- a/internal/pool/cooldown.go
++++ b/internal/pool/cooldown.go
+@@ -109,6 +109,59 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
+ 	}
+ }
+ 
++// ModelBusyReasonPrefix 14003「Model busy」在 pool.modelCooldowns 里的 reason 前缀。
++// BlockModelClear 按此前缀识别并在该模型成功后清除；与 6004 条目（成功不清）区分。
++const ModelBusyReasonPrefix = "14003"
++
++// CooldownSoftForModelBackoff 14003「too many requests / Model busy」的模型级短退避入口。
++//
++// 上游文案明确让客户端「switch models or retry later」，说明这是模型维度繁忙，不是账号
++// 被封；旧实现按账号级 CooldownSoftRate 冷却，会把同账号的 SG 等其它模型一起封死。
++//
++//   - 只写 modelCooldowns[model]，不碰 until/coolKind/softStreak（账号级域）；
++//   - base 起按 Hits 指数退避（×2^min(hits-1, modelBusyShift)），封顶 modelBusyMaxTTL；
++//   - 已在冷却中再次命中不延长（兜底探测不堆冷却）；
++//   - 该模型请求成功由 BlockModelClear 清除。
++func (p *Pool) CooldownSoftForModelBackoff(uid, model string, base time.Duration, reason string) {
++	if uid == "" || model == "" {
++		return
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	e, ok := p.byUID[uid]
++	if !ok {
++		return
++	}
++	if base <= 0 {
++		base = modelBusyBaseTTL
++	}
++	now := time.Now()
++	hits := 0
++	if e.modelCooldowns != nil {
++		mc := e.modelCooldowns[model]
++		if now.Before(mc.Until) {
++			return
++		}
++		hits = mc.Hits
++	}
++	hits++
++	ttl := base
++	if d := base * (1 << uint(min(hits-1, modelBusyShift))); d < modelBusyMaxTTL {
++		ttl = d
++	} else {
++		ttl = modelBusyMaxTTL
++	}
++	if e.modelCooldowns == nil {
++		e.modelCooldowns = map[string]modelCooldown{}
++	}
++	e.modelCooldowns[model] = modelCooldown{
++		Until:  now.Add(ttl),
++		Reason: reason,
++		Hits:   hits,
++	}
++	p.dirty.Store(true)
++}
++
+ // BlockModelBackoff 11102「该后端无此模型」的 (账号, 模型) 负缓存入口（handler.applyErrorPolicy
+ // 调用）。复用 modelCooldowns 机制（不新建平行状态）：写 modelCooldowns[model]，Until 为指数退避
+ // TTL，选号侧 healthyForModel 自动对该账号避开该模型。
+@@ -156,10 +209,13 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
+ 	p.dirty.Store(true)
+ }
+ 
+-// BlockModelClear 清除 (账号, 模型) 的 11102 负缓存条目（该模型实测又通了）。半开探测或正常
+-// 请求对该模型成功后调用（handler 成功路径）。只清 11102 条目、不碰 6004 独立冷却表——
+-// 6004 有自身上游重置墙钟语义，成功不该抹掉（见 NoteSuccess 注释）。reason 前缀判定区分两者：
+-// 11102 条目的 reason 恒以 "11102" 开头（见上游 BlockModelReason）。
++// BlockModelClear 清除 (账号, 模型) 的临时模型级避让条目（该模型实测又通了）。
++// 半开探测或正常请求对该模型成功后调用（handler 成功路径）。清两类：
++//   - 11102「该后端无此模型」负缓存；
++//   - 14003「Model busy」短退避（ModelBusyReasonPrefix）。
++//
++// 不碰 6004 独立冷却表——6004 有自身上游重置墙钟语义，成功不该抹掉（见 NoteSuccess 注释）。
++// reason 前缀判定区分三者：11102 / 14003 条目可清，6004 条目保留。
+ func (p *Pool) BlockModelClear(uid, model string) {
+ 	if uid == "" || model == "" {
+ 		return
+@@ -171,7 +227,7 @@ func (p *Pool) BlockModelClear(uid, model string) {
+ 		return
+ 	}
+ 	mc, exists := e.modelCooldowns[model]
+-	if !exists || !strings.HasPrefix(mc.Reason, "11102") {
++	if !exists || (!strings.HasPrefix(mc.Reason, "11102") && !strings.HasPrefix(mc.Reason, ModelBusyReasonPrefix)) {
+ 		return
+ 	}
+ 	delete(e.modelCooldowns, model)
+diff --git a/internal/pool/entry.go b/internal/pool/entry.go
+index 6c5edf9..7917734 100644
+--- a/internal/pool/entry.go
++++ b/internal/pool/entry.go
+@@ -483,6 +483,16 @@ const (
+ 	modelBlockShift   = 6 // 2^6=64 倍后封顶：6h×64>24h，实际封顶锚定 24h
+ )
+ 
++// 14003「too many requests / Model busy」的模型级短退避参数。
++// 上游文案明确让客户端「switch models or retry later」，属于模型维度繁忙，不是账号被封；
++// 因此只锁触发模型（复用 modelCooldowns），60s 起、指数退避、封顶 10 分钟，
++// 该模型成功一次即清。免费 flash 被 14003 时，SG 等其它模型仍可继续服务。
++const (
++	modelBusyBaseTTL = time.Minute
++	modelBusyMaxTTL  = 10 * time.Minute
++	modelBusyShift   = 4 // 1m→2m→4m→8m→10m（封顶）
++)
++
+ // sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。
+ // 12153 会被临时性触发（网络抖动/上游闪断/refresh 竞态），一次失败即禁用的旧行为
+ // 会误杀健康账号（P0-1：13 个 disabled 号全是误判）。3 次连续才判死：容忍偶发抖动，
+diff --git a/internal/pool/modelcooldown_test.go b/internal/pool/modelcooldown_test.go
+index 5fb8dbd..83b30c5 100644
+--- a/internal/pool/modelcooldown_test.go
++++ b/internal/pool/modelcooldown_test.go
+@@ -754,6 +754,82 @@ func TestBlockModelClear6004NotClearedByPrefix(t *testing.T) {
+ 	}
+ }
+ 
++// TestCooldownSoftForModelBackoffScopesToModel 14003「Model busy」只锁触发模型：
++// 账号级 until 保持零值，免费 flash 被锁时 SG 仍 healthyForModel=true。
++func TestCooldownSoftForModelBackoffScopesToModel(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.CooldownSoftForModelBackoff("u1", "deepseek-v4.1-flash", time.Minute, "14003 model busy")
++
++	st, ok := p.Status("u1")
++	if !ok {
++		t.Fatal("u1 missing")
++	}
++	if !st.Until.IsZero() {
++		t.Errorf("14003 不得写账号级 until，got %v", st.Until)
++	}
++	if st.Cooling {
++		t.Errorf("14003 是模型级繁忙，账号本身不应被标记 cooling: %+v", st)
++	}
++	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "deepseek-v4.1-flash" {
++		t.Fatalf("应只有免费 flash 的模型级台账: %+v", st.RateLimitedModels)
++	}
++
++	now := time.Now()
++	p.mu.RLock()
++	e := p.byUID["u1"]
++	flashOK := e.healthyForModel(now, "deepseek-v4.1-flash")
++	sgOK := e.healthyForModel(now, "deepseek-v4.1-flash-sg")
++	p.mu.RUnlock()
++	if flashOK {
++		t.Errorf("触发 14003 的免费 flash 应被锁")
++	}
++	if !sgOK {
++		t.Errorf("SG 是独立模型，不应被免费 flash 的 14003 连坐")
++	}
++}
++
++// TestCooldownSoftForModelBackoffNoExtend 已在冷却中的兜底探测不延长 TTL、不推进 Hits。
++func TestCooldownSoftForModelBackoffNoExtend(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.CooldownSoftForModelBackoff("u1", "m", time.Minute, "14003 model busy")
++	p.mu.RLock()
++	first := p.byUID["u1"].modelCooldowns["m"]
++	p.mu.RUnlock()
++
++	p.CooldownSoftForModelBackoff("u1", "m", time.Minute, "14003 model busy")
++	p.mu.RLock()
++	second := p.byUID["u1"].modelCooldowns["m"]
++	p.mu.RUnlock()
++	if second.Hits != first.Hits {
++		t.Errorf("冷却中重复命中不应推进 Hits: %d -> %d", first.Hits, second.Hits)
++	}
++	if d := second.Until.Sub(first.Until); d > time.Second || d < -time.Second {
++		t.Errorf("冷却中重复命中不应延长 Until: %v -> %v", first.Until, second.Until)
++	}
++}
++
++// TestBlockModelClearClears14003 成功路径清 14003 短退避，但不碰 6004。
++func TestBlockModelClearClears14003(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.CooldownSoftForModelBackoff("u1", "deepseek-v4.1-flash", time.Minute, "14003 model busy")
++	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(30*time.Minute), "glm-5.3", "6004 model rate limit")
++
++	p.BlockModelClear("u1", "deepseek-v4.1-flash")
++	p.mu.RLock()
++	_, busyGone := p.byUID["u1"].modelCooldowns["deepseek-v4.1-flash"]
++	_, sixGone := p.byUID["u1"].modelCooldowns["glm-5.3"]
++	p.mu.RUnlock()
++	if busyGone {
++		t.Errorf("BlockModelClear 后 14003 条目应清除")
++	}
++	if !sixGone {
++		t.Errorf("BlockModelClear 不得清除 6004 条目")
++	}
++}
++
+ // TestBlockModelBackoffPickSkips 11102 后选号器对该账号该模型避开（Pick 对 glm 豁免 u1 恢复）。
+ func TestBlockModelBackoffPickSkips(t *testing.T) {
+ 	withNoPickGap(t)
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index 073d8fa..06daae1 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -908,8 +908,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 			continue
+ 		}
+ 		h.cfg.Pool.NoteSuccess(acct.UID)
+-		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
+-		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
++		// 11102/14003 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
++		// BlockModelClear 按 reason 前缀识别，只清 11102/14003 条目、不碰 6004 独立冷却。
+ 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+ 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
+ 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
+@@ -1063,10 +1063,11 @@ func rotateBackoff(i int, ctx context.Context) bool {
+ //
+ // 十条路径，各司其职：
+ //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
+-//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
+-//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
+-//     softStreak 翻倍、封顶 soft_rate_max，冷却中兜底探测不翻倍）。P1-2 后冷却时长
+-//     优先采信 Retry-After 头（uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
++//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 / 14003 走模型级豁免、
++//     其余走账号级，均不指数堆加）；无重置时间时 14003 走模型级短退避（60s 起、封顶
++//     10m），其余走账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶 soft_rate_max，
++//     冷却中兜底探测不翻倍）。P1-2 后冷却时长优先采信 Retry-After 头
++//     （uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
+ //   - ErrWafBlock → 账号级软冷却（WAF 403 修复 P0-1）：**不 Disable**——WAF 403 是
+ //     IP/指纹维频控信号（报告 §6：双账号 403 后账号本身健康），罚过即走、到期自愈。
+ //     时长优先 Retry-After 头（P1-2）；缺失按 wafCooldownBase(60s) 起 · 2^softStreak
+@@ -1129,18 +1130,33 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」，无论业务
+ 		// code 是 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不
+ 		// softStreak 指数堆加。
+-		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型
+-		//     豁免（既有 issue #31 语义）。
+-		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免
++		//   - 模型级（6004 / 14003 Model busy）→ CooldownSoftForModel：写
++		//     modelCooldowns[model]，切模型豁免（issue #31 语义；14003 上游原文
++		//     明确让客户端 switch models，不能按账号级封死 SG 等其它模型）。
++		//   - 账号级（其余）→ CooldownSoftRate：写账号级 until，不产生模型豁免
+ 		//     （普通账号级限流不该因切模型绕过）。
+ 		if resetAt, ok := upstream.ParseRateReset(body); ok {
+ 			if upstream.IsModelRateLimit(body) {
+ 				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
+ 				return
+ 			}
++			if upstream.IsModelBusy(body) {
++				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, upstream.ModelBusyReason)
++				return
++			}
+ 			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
+ 			return
+ 		}
++		// 14003 无重置文案：只锁触发模型的短退避（60s 起、封顶 10m），
++		// 免费 flash 繁忙时 SG 等其它模型仍可选；有 Retry-After 头时对齐该时刻。
++		if upstream.IsModelBusy(body) {
++			if uerr != nil && uerr.RetryAfter > 0 {
++				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, time.Now().Add(uerr.RetryAfter), model, upstream.ModelBusyReason)
++			} else {
++				h.cfg.Pool.CooldownSoftForModelBackoff(uid, model, 0, upstream.ModelBusyReason)
++			}
++			return
++		}
+ 		// P1-2：body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加，
+ 		// 与重置墙钟同一对齐语义）。头优先于「有界退避」，但**低于** body 重置文案
+ 		// （上方已 return）——文案是上游更权威的口径（WAF 403 报告 §2.1：intl CLI
+diff --git a/internal/server/handler_test.go b/internal/server/handler_test.go
+index 776c3e5..eab6f1b 100644
+--- a/internal/server/handler_test.go
++++ b/internal/server/handler_test.go
+@@ -731,6 +731,87 @@ func TestApplyErrorPolicySoftRateResetTime11140(t *testing.T) {
+ 	}
+ }
+ 
++// TestApplyErrorPolicy14003ModelScope handler 层回归：14003「Model busy」必须走模型级
++// 短退避（只锁触发模型、不写账号级 until），否则免费 flash 繁忙会把 SG 一起封死。
++func TestApplyErrorPolicy14003ModelScope(t *testing.T) {
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
++
++	body := `{"code":14003,"msg":"too many requests","displayMsg":{"en":"Model busy. Please switch models or retry later","zh":"模型繁忙，请换模型或稍后重试"}}`
++	h.applyErrorPolicy("u1", upstream.ErrSoftRate, body, "deepseek-v4.1-flash", nil)
++
++	st, ok := p.Status("u1")
++	if !ok {
++		t.Fatal("u1 missing")
++	}
++	if !st.Until.IsZero() {
++		t.Errorf("14003 不得写账号级 until，got %v", st.Until)
++	}
++	if st.Cooling {
++		t.Errorf("14003 是模型级繁忙，账号本身不应 cooling: %+v", st)
++	}
++	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "deepseek-v4.1-flash" {
++		t.Fatalf("应只有免费 flash 的模型级台账: %+v", st.RateLimitedModels)
++	}
++	if st.RateLimitedModels[0].Reason != upstream.ModelBusyReason {
++		t.Errorf("reason=%q want %q", st.RateLimitedModels[0].Reason, upstream.ModelBusyReason)
++	}
++	if rem := time.Until(st.RateLimitedModels[0].Until); rem <= 0 || rem > 61*time.Second {
++		t.Errorf("首次 14003 退避应约 60s，got %v", rem)
++	}
++}
++
++// TestChat14003ModelScope 端到端：上游 429 + code 14003「Model busy」→ 只锁触发模型，
++// 同模型请求换号、SG 模型仍可选该账号（不再把整号冷却）。
++func TestChat14003ModelScope(t *testing.T) {
++	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++		if authz == "Bearer at-bad" {
++			return 429, `{"code":14003,"msg":"too many requests","displayMsg":{"en":"Model busy. Please switch models or retry later","zh":"模型繁忙，请换模型或稍后重试"}}`, false
++		}
++		return 200, sseOK, true
++	})
++	p := testPoolWith(
++		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
++		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
++	)
++	p.SetCredits("bad", 2000)
++	p.SetCredits("good", 1000)
++	h := NewHandler(Config{Pool: p, Upstream: up})
++
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
++	if rec.Code != 200 {
++		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
++	}
++
++	st, _ := p.Status("bad")
++	if !st.Until.IsZero() {
++		t.Errorf("Status.Until=%v 应为零值（14003 不写账号级 until）", st.Until)
++	}
++	if st.Cooling {
++		t.Errorf("14003 是模型级繁忙，账号本身不应 cooling: %+v", st)
++	}
++	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "deepseek-v4.1-flash" {
++		t.Fatalf("bad should have flash model limit ledger: %+v", st.RateLimitedModels)
++	}
++	if st.RateLimitedModels[0].Reason != upstream.ModelBusyReason {
++		t.Errorf("reason=%q want %q", st.RateLimitedModels[0].Reason, upstream.ModelBusyReason)
++	}
++
++	p.SetRandomSource(func(n int64) int64 { return 0 })
++	same := p.PickExcludingForRealm(nil, "deepseek-v4.1-flash", "")
++	if same == nil || same.UID != "good" {
++		t.Fatalf("same-model pick should skip bad (flash busy), got %+v", same)
++	}
++	sg := p.PickExcludingForRealm(nil, "deepseek-v4.1-flash-sg", "")
++	if sg == nil || sg.UID != "bad" {
++		t.Fatalf("SG model should still pick bad (not dragged down by flash 14003), got %+v", sg)
++	}
++}
++
++
+ // TestApplyErrorPolicyNotFoundUsesFixedBase 404 分流：偶发上游 404 的冷却基数固定 60s
+ // （notFoundCooldown），不取 soft_rate 的 600s 基数，也不受其配置值影响，且不参与
+ // softStreak 指数退避（404 是偶发路径缺失，不是限流信号，不该因 404 升级惩罚，
+@@ -2460,7 +2541,7 @@ func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
+ }
+ 
+ // TestStaleSnapshotBoundedByPickGate 粘性快照陈旧被 Pick 闸兜底的契约锚
+-//（pr134-watchlist-analysis.md #10）：
++// （pr134-watchlist-analysis.md #10）：
+ // session.ResolveForModel 在取任何锁之前拿 pool 可用性快照——若快照后、Pick 前
+ // 粘性号 A 被冷却（快照陈旧判 available），Session 层仍会返回 A 作为建议 uid；
+ // 但真正的可用性权威闸是 handler 的 Pool.PickByUIDForModel（锁内新鲜判定
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index e1076da..f71395b 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -338,6 +338,28 @@ func IsModelRateLimit(body string) bool {
+ 	return reModelRateLimit.MatchString(body)
+ }
+ 
++// modelBusyCode 明确指向「模型繁忙」的业务 code。上游 14003 的文案是
++// "too many requests" + displayMsg "Model busy. Please switch models or retry later"，
++// 属于模型维度繁忙，不是账号整体被封；旧实现按账号级冷却会把 SG 等其它模型一起封死。
++const modelBusyCode = "14003"
++
++// ModelBusyReason 14003 模型级短退避在 pool.modelCooldowns 里的 reason 值。
++const ModelBusyReason = "14003 model busy"
++
++var (
++	reModelBusy    = regexp.MustCompile(`"code"\s*:\s*"?` + modelBusyCode + `"?`)
++	reModelBusyMsg = regexp.MustCompile(`(?i)model busy|模型繁忙`)
++)
++
++// IsModelBusy 报告 429 body 是否明确指向模型级繁忙（业务 code 14003，或上游固定文案
++// "Model busy" / "模型繁忙"）。命中后只锁触发模型，其它模型（如 -sg）保持可用。
++func IsModelBusy(body string) bool {
++	if body == "" {
++		return false
++	}
++	return reModelBusy.MatchString(body) || reModelBusyMsg.MatchString(body)
++}
++
+ // modelBlockCode 明确指向「该后端无此模型」的业务 code（reference converter.MODEL_NOT_SERVABLE_CODES）。
+ const modelBlockCode = "11102"
+ 
+diff --git a/internal/upstream/client_test.go b/internal/upstream/client_test.go
+index 7681b73..3ec9497 100644
+--- a/internal/upstream/client_test.go
++++ b/internal/upstream/client_test.go
+@@ -148,7 +148,7 @@ func TestIsWafBlocked(t *testing.T) {
+ 	}{
+ 		{403, "", true},
+ 		{403, "<html>blocked</html>", true},
+-		{403, `{"code":1}`, false},               // 有 "code": 字段
++		{403, `{"code":1}`, false},                // 有 "code": 字段
+ 		{403, `{"msg":"request illegal"}`, false}, // 有 "msg": 字段（且该文案本就该走 accountFault）
+ 		{402, "", false},                          // 非 403
+ 		{429, "", false},
+@@ -305,6 +305,31 @@ func TestIsModelRateLimit(t *testing.T) {
+ 	}
+ }
+ 
++// TestIsModelBusy 14003「Model busy」判定：只认 code 14003 或上游固定文案，
++// 用于把「模型繁忙」从账号级 429 中拆出来（免费 flash 繁忙时 SG 仍可用）。
++func TestIsModelBusy(t *testing.T) {
++	cases := []struct {
++		body string
++		want bool
++	}{
++		{`{"code":14003,"msg":"too many requests","displayMsg":{"en":"Model busy. Please switch models or retry later","zh":"模型繁忙，请换模型或稍后重试"}}`, true},
++		{`{"code": 14003,"msg":"x"}`, true},
++		{`{"code":"14003","msg":"x"}`, true},
++		{`{"msg":"Model busy. Please switch models or retry later"}`, true},
++		{`{"msg":"模型繁忙，请换模型或稍后重试"}`, true},
++		// 账号级限流不得误判为模型繁忙。
++		{`{"code":11140,"msg":"The model provider is rate-limiting requests."}`, false},
++		{`{"code":6004,"msg":"usage exceeds frequency limit"}`, false},
++		{`{"code":1,"msg":"429 rate limit"}`, false},
++		{``, false},
++	}
++	for _, c := range cases {
++		if got := IsModelBusy(c.body); got != c.want {
++			t.Errorf("IsModelBusy(%q)=%v want %v", c.body, got, c.want)
++		}
++	}
++}
++
+ // TestIsModelBlocked 11102「该后端无此模型」判定：只认 code 精确等于 11102 或 msg 命中
+ // 窄短语 "service info not found"，且仅在 400/404 下判。覆盖 reference 报告「11102 撞在
+ // ID 上」的坑——requestId 里的 11102 不得误判。

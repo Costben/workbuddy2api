@@ -731,6 +731,87 @@ func TestApplyErrorPolicySoftRateResetTime11140(t *testing.T) {
 	}
 }
 
+// TestApplyErrorPolicy14003ModelScope handler 层回归：14003「Model busy」必须走模型级
+// 短退避（只锁触发模型、不写账号级 until），否则免费 flash 繁忙会把 SG 一起封死。
+func TestApplyErrorPolicy14003ModelScope(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
+
+	body := `{"code":14003,"msg":"too many requests","displayMsg":{"en":"Model busy. Please switch models or retry later","zh":"模型繁忙，请换模型或稍后重试"}}`
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, body, "deepseek-v4.1-flash", nil)
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("u1 missing")
+	}
+	if !st.Until.IsZero() {
+		t.Errorf("14003 不得写账号级 until，got %v", st.Until)
+	}
+	if st.Cooling {
+		t.Errorf("14003 是模型级繁忙，账号本身不应 cooling: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "deepseek-v4.1-flash" {
+		t.Fatalf("应只有免费 flash 的模型级台账: %+v", st.RateLimitedModels)
+	}
+	if st.RateLimitedModels[0].Reason != upstream.ModelBusyReason {
+		t.Errorf("reason=%q want %q", st.RateLimitedModels[0].Reason, upstream.ModelBusyReason)
+	}
+	if rem := time.Until(st.RateLimitedModels[0].Until); rem <= 0 || rem > 61*time.Second {
+		t.Errorf("首次 14003 退避应约 60s，got %v", rem)
+	}
+}
+
+// TestChat14003ModelScope 端到端：上游 429 + code 14003「Model busy」→ 只锁触发模型，
+// 同模型请求换号、SG 模型仍可选该账号（不再把整号冷却）。
+func TestChat14003ModelScope(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 429, `{"code":14003,"msg":"too many requests","displayMsg":{"en":"Model busy. Please switch models or retry later","zh":"模型繁忙，请换模型或稍后重试"}}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000)
+	p.SetCredits("good", 1000)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
+	}
+
+	st, _ := p.Status("bad")
+	if !st.Until.IsZero() {
+		t.Errorf("Status.Until=%v 应为零值（14003 不写账号级 until）", st.Until)
+	}
+	if st.Cooling {
+		t.Errorf("14003 是模型级繁忙，账号本身不应 cooling: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "deepseek-v4.1-flash" {
+		t.Fatalf("bad should have flash model limit ledger: %+v", st.RateLimitedModels)
+	}
+	if st.RateLimitedModels[0].Reason != upstream.ModelBusyReason {
+		t.Errorf("reason=%q want %q", st.RateLimitedModels[0].Reason, upstream.ModelBusyReason)
+	}
+
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	same := p.PickExcludingForRealm(nil, "deepseek-v4.1-flash", "")
+	if same == nil || same.UID != "good" {
+		t.Fatalf("same-model pick should skip bad (flash busy), got %+v", same)
+	}
+	sg := p.PickExcludingForRealm(nil, "deepseek-v4.1-flash-sg", "")
+	if sg == nil || sg.UID != "bad" {
+		t.Fatalf("SG model should still pick bad (not dragged down by flash 14003), got %+v", sg)
+	}
+}
+
+
 // TestApplyErrorPolicyNotFoundUsesFixedBase 404 分流：偶发上游 404 的冷却基数固定 60s
 // （notFoundCooldown），不取 soft_rate 的 600s 基数，也不受其配置值影响，且不参与
 // softStreak 指数退避（404 是偶发路径缺失，不是限流信号，不该因 404 升级惩罚，
@@ -2460,7 +2541,7 @@ func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
 }
 
 // TestStaleSnapshotBoundedByPickGate 粘性快照陈旧被 Pick 闸兜底的契约锚
-//（pr134-watchlist-analysis.md #10）：
+// （pr134-watchlist-analysis.md #10）：
 // session.ResolveForModel 在取任何锁之前拿 pool 可用性快照——若快照后、Pick 前
 // 粘性号 A 被冷却（快照陈旧判 available），Session 层仍会返回 A 作为建议 uid；
 // 但真正的可用性权威闸是 handler 的 Pool.PickByUIDForModel（锁内新鲜判定

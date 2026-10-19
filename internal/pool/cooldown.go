@@ -109,6 +109,59 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 	}
 }
 
+// ModelBusyReasonPrefix 14003「Model busy」在 pool.modelCooldowns 里的 reason 前缀。
+// BlockModelClear 按此前缀识别并在该模型成功后清除；与 6004 条目（成功不清）区分。
+const ModelBusyReasonPrefix = "14003"
+
+// CooldownSoftForModelBackoff 14003「too many requests / Model busy」的模型级短退避入口。
+//
+// 上游文案明确让客户端「switch models or retry later」，说明这是模型维度繁忙，不是账号
+// 被封；旧实现按账号级 CooldownSoftRate 冷却，会把同账号的 SG 等其它模型一起封死。
+//
+//   - 只写 modelCooldowns[model]，不碰 until/coolKind/softStreak（账号级域）；
+//   - base 起按 Hits 指数退避（×2^min(hits-1, modelBusyShift)），封顶 modelBusyMaxTTL；
+//   - 已在冷却中再次命中不延长（兜底探测不堆冷却）；
+//   - 该模型请求成功由 BlockModelClear 清除。
+func (p *Pool) CooldownSoftForModelBackoff(uid, model string, base time.Duration, reason string) {
+	if uid == "" || model == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	if base <= 0 {
+		base = modelBusyBaseTTL
+	}
+	now := time.Now()
+	hits := 0
+	if e.modelCooldowns != nil {
+		mc := e.modelCooldowns[model]
+		if now.Before(mc.Until) {
+			return
+		}
+		hits = mc.Hits
+	}
+	hits++
+	ttl := base
+	if d := base * (1 << uint(min(hits-1, modelBusyShift))); d < modelBusyMaxTTL {
+		ttl = d
+	} else {
+		ttl = modelBusyMaxTTL
+	}
+	if e.modelCooldowns == nil {
+		e.modelCooldowns = map[string]modelCooldown{}
+	}
+	e.modelCooldowns[model] = modelCooldown{
+		Until:  now.Add(ttl),
+		Reason: reason,
+		Hits:   hits,
+	}
+	p.dirty.Store(true)
+}
+
 // BlockModelBackoff 11102「该后端无此模型」的 (账号, 模型) 负缓存入口（handler.applyErrorPolicy
 // 调用）。复用 modelCooldowns 机制（不新建平行状态）：写 modelCooldowns[model]，Until 为指数退避
 // TTL，选号侧 healthyForModel 自动对该账号避开该模型。
@@ -156,10 +209,13 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	p.dirty.Store(true)
 }
 
-// BlockModelClear 清除 (账号, 模型) 的 11102 负缓存条目（该模型实测又通了）。半开探测或正常
-// 请求对该模型成功后调用（handler 成功路径）。只清 11102 条目、不碰 6004 独立冷却表——
-// 6004 有自身上游重置墙钟语义，成功不该抹掉（见 NoteSuccess 注释）。reason 前缀判定区分两者：
-// 11102 条目的 reason 恒以 "11102" 开头（见上游 BlockModelReason）。
+// BlockModelClear 清除 (账号, 模型) 的临时模型级避让条目（该模型实测又通了）。
+// 半开探测或正常请求对该模型成功后调用（handler 成功路径）。清两类：
+//   - 11102「该后端无此模型」负缓存；
+//   - 14003「Model busy」短退避（ModelBusyReasonPrefix）。
+//
+// 不碰 6004 独立冷却表——6004 有自身上游重置墙钟语义，成功不该抹掉（见 NoteSuccess 注释）。
+// reason 前缀判定区分三者：11102 / 14003 条目可清，6004 条目保留。
 func (p *Pool) BlockModelClear(uid, model string) {
 	if uid == "" || model == "" {
 		return
@@ -171,7 +227,7 @@ func (p *Pool) BlockModelClear(uid, model string) {
 		return
 	}
 	mc, exists := e.modelCooldowns[model]
-	if !exists || !strings.HasPrefix(mc.Reason, "11102") {
+	if !exists || (!strings.HasPrefix(mc.Reason, "11102") && !strings.HasPrefix(mc.Reason, ModelBusyReasonPrefix)) {
 		return
 	}
 	delete(e.modelCooldowns, model)

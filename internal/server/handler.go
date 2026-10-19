@@ -908,8 +908,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
-		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
-		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
+		// 11102/14003 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
+		// BlockModelClear 按 reason 前缀识别，只清 11102/14003 条目、不碰 6004 独立冷却。
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
@@ -1063,10 +1063,11 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //
 // 十条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
-//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
-//     softStreak 翻倍、封顶 soft_rate_max，冷却中兜底探测不翻倍）。P1-2 后冷却时长
-//     优先采信 Retry-After 头（uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
+//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 / 14003 走模型级豁免、
+//     其余走账号级，均不指数堆加）；无重置时间时 14003 走模型级短退避（60s 起、封顶
+//     10m），其余走账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶 soft_rate_max，
+//     冷却中兜底探测不翻倍）。P1-2 后冷却时长优先采信 Retry-After 头
+//     （uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
 //   - ErrWafBlock → 账号级软冷却（WAF 403 修复 P0-1）：**不 Disable**——WAF 403 是
 //     IP/指纹维频控信号（报告 §6：双账号 403 后账号本身健康），罚过即走、到期自愈。
 //     时长优先 Retry-After 头（P1-2）；缺失按 wafCooldownBase(60s) 起 · 2^softStreak
@@ -1129,16 +1130,31 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」，无论业务
 		// code 是 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不
 		// softStreak 指数堆加。
-		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型
-		//     豁免（既有 issue #31 语义）。
-		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免
+		//   - 模型级（6004 / 14003 Model busy）→ CooldownSoftForModel：写
+		//     modelCooldowns[model]，切模型豁免（issue #31 语义；14003 上游原文
+		//     明确让客户端 switch models，不能按账号级封死 SG 等其它模型）。
+		//   - 账号级（其余）→ CooldownSoftRate：写账号级 until，不产生模型豁免
 		//     （普通账号级限流不该因切模型绕过）。
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			if upstream.IsModelRateLimit(body) {
 				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
 				return
 			}
+			if upstream.IsModelBusy(body) {
+				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, upstream.ModelBusyReason)
+				return
+			}
 			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
+			return
+		}
+		// 14003 无重置文案：只锁触发模型的短退避（60s 起、封顶 10m），
+		// 免费 flash 繁忙时 SG 等其它模型仍可选；有 Retry-After 头时对齐该时刻。
+		if upstream.IsModelBusy(body) {
+			if uerr != nil && uerr.RetryAfter > 0 {
+				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, time.Now().Add(uerr.RetryAfter), model, upstream.ModelBusyReason)
+			} else {
+				h.cfg.Pool.CooldownSoftForModelBackoff(uid, model, 0, upstream.ModelBusyReason)
+			}
 			return
 		}
 		// P1-2：body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加，
