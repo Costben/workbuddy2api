@@ -1,8 +1,8 @@
 diff --git a/cmd/server/config.go b/cmd/server/config.go
-index 0d570df..bd20d66 100644
+index f483e0e..da2ce4d 100644
 --- a/cmd/server/config.go
 +++ b/cmd/server/config.go
-@@ -153,9 +153,10 @@ type Config struct {
+@@ -163,9 +163,10 @@ type Config struct {
  	} `json:"pool"`
  
  	SessionSticky struct {
@@ -16,7 +16,7 @@ index 0d570df..bd20d66 100644
  	} `json:"session_sticky"`
  
  	// 解析后
-@@ -168,6 +169,7 @@ type Config struct {
+@@ -178,6 +179,7 @@ type Config struct {
  	DegradeCooldownMaxD time.Duration `json:"-"`
  	SessionTTL          time.Duration `json:"-"`
  	SessionGCInterval   time.Duration `json:"-"`
@@ -24,7 +24,7 @@ index 0d570df..bd20d66 100644
  	ExpiringSoonDur     time.Duration `json:"-"`
  	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
  	CostExploreIntervalDur time.Duration `json:"-"`
-@@ -219,6 +221,7 @@ func Default() *Config {
+@@ -231,6 +233,7 @@ func Default() *Config {
  	c.SessionSticky.Enabled = true
  	c.SessionSticky.TTL = "30m"
  	c.SessionSticky.GCInterval = "5m"
@@ -32,7 +32,7 @@ index 0d570df..bd20d66 100644
  	return c
  }
  
-@@ -400,6 +403,12 @@ func (c *Config) normalize() error {
+@@ -420,6 +423,12 @@ func (c *Config) normalize() error {
  	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
  		return fmt.Errorf("session_sticky.gc_interval: %w", err)
  	}
@@ -46,18 +46,20 @@ index 0d570df..bd20d66 100644
  		c.Pool.BreakerThreshold = 3
  	}
 diff --git a/cmd/server/main.go b/cmd/server/main.go
-index ca5a055..5576353 100644
+index d6a9e29..83bea50 100644
 --- a/cmd/server/main.go
 +++ b/cmd/server/main.go
-@@ -113,6 +113,7 @@ func main() {
- 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏，
- 			// 见 wiring.go）；裸名走 cn（现状零回归）。
- 			AvailableForModel: realmAwareAvailableForModel(p),
-+			EligibleForModel:  realmAwareEligibleForModel(p, cfg.SessionWaitTimeout),
+@@ -122,7 +122,8 @@ func main() {
+ 			// 首绑按三因子权重分配（issue #265）：粘性命中即定，若首绑仍按哈希取模，
+ 			// 「快过期积分优先消耗」这条池权重在默认配置下就永远轮不到——带会话标识的
+ 			// 请求首轮绑定后滚动续期，压根走不到 Pool.pick。
+-			PickForModel: realmAwareWeightedPick(p),
++			PickForModel:     realmAwareWeightedPick(p),
++			EligibleForModel: realmAwareEligibleForModel(p, cfg.SessionWaitTimeout),
  		})
  		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
  		sessRouter.StartGC()
-@@ -221,6 +222,7 @@ func main() {
+@@ -231,6 +232,7 @@ func main() {
  		Upstream:     up,
  		APIKey:       cfg.APIKey,
  		Session:      sessRouter,
@@ -66,7 +68,7 @@ index ca5a055..5576353 100644
  		RedisMode:    redisMode,
  		SoftCooldown: cfg.SoftRateDur,
 diff --git a/cmd/server/wiring.go b/cmd/server/wiring.go
-index a5efefb..2f30ce4 100644
+index 51f762d..f3cff9f 100644
 --- a/cmd/server/wiring.go
 +++ b/cmd/server/wiring.go
 @@ -1,6 +1,7 @@
@@ -77,13 +79,10 @@ index a5efefb..2f30ce4 100644
  	"workbuddy2api/internal/pool"
  	"workbuddy2api/internal/server"
  )
-@@ -18,4 +19,14 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
- 		realm, bare := server.ResolveModel(model)
- 		return p.AvailableUIDsForModelRealm(bare, realm)
+@@ -35,3 +36,13 @@ func realmAwareWeightedPick(p *pool.Pool) func(model string, candidates []string
+ 		return p.WeightedPickAmong(candidates, bare)
  	}
--}
-\ No newline at end of file
-+}
+ }
 +
 +func realmAwareEligibleForModel(p *pool.Pool, wait time.Duration) func(model string) []string {
 +	if wait <= 0 {
@@ -336,7 +335,7 @@ index 0000000..5714ef8
 +	}
 +}
 diff --git a/internal/server/handler.go b/internal/server/handler.go
-index 311c1bc..073d8fa 100644
+index eb6f047..29a60de 100644
 --- a/internal/server/handler.go
 +++ b/internal/server/handler.go
 @@ -31,6 +31,8 @@ type Config struct {
@@ -488,20 +487,21 @@ index 0000000..604b639
 +	return ExtractKey(body)
 +}
 diff --git a/internal/session/session.go b/internal/session/session.go
-index 2e238fb..f9ebf7b 100644
+index b92b54c..9c65269 100644
 --- a/internal/session/session.go
 +++ b/internal/session/session.go
-@@ -42,6 +42,9 @@ type Config struct {
- 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
- 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
- 	AvailableForModel func(model string) []string
+@@ -57,6 +57,10 @@ type Config struct {
+ 	// 实现方注意：本回调在 Router 写锁内被调用，实现不得回调本 Router（会有死锁风险），
+ 	// 也不应长时间阻塞。
+ 	PickForModel func(model string, candidates []string) string
++
 +	// EligibleForModel excludes failed/disabled accounts but retains busy ones.
 +	// It validates existing bindings only; new assignments use AvailableForModel.
 +	EligibleForModel func(model string) []string
  }
  
  // Router 会话粘性路由器。
-@@ -142,13 +145,20 @@ func (r *Router) LoadFromStore() {
+@@ -157,13 +161,20 @@ func (r *Router) LoadFromStore() {
  func (r *Router) ResolveForModel(key, model string) (string, bool) {
  	now := time.Now()
  	available := r.availableSet(model)
@@ -523,7 +523,7 @@ index 2e238fb..f9ebf7b 100644
  			r.touch(key, e.uid, now)
  			return e.uid, true
  		}
-@@ -161,7 +171,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
+@@ -176,7 +187,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
  
  	// re-check：并发同 key 可能已被其他 goroutine 分配好。
  	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
@@ -532,22 +532,7 @@ index 2e238fb..f9ebf7b 100644
  			r.entries[key] = entry{uid: e2.uid, lastActive: now}
  			return e2.uid, true
  		}
-@@ -305,11 +315,11 @@ func hashIndex(key string, n int) int {
- //  5. prompt_cache_key（第 5 项，见下）
- //
- // 前四项均为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
--//（P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
-+// （P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
- // user 的全部并行对话会钉同一账号（粘性范围远大于上游 prompt cache 的对话级边界），
- // 且曾抢占顶层 conversation_id 的优先级。剔除后发 user_id 的客户端回落加权轮换
--//（与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
--//（7d 兜底）自然过期，键消失不产生脏绑定。
-+// （与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
-+// （7d 兜底）自然过期，键消失不产生脏绑定。
- //
- // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
- // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
-@@ -361,6 +371,8 @@ func ExtractKey(body []byte) string {
+@@ -397,6 +408,8 @@ func ExtractKey(body []byte) string {
  //
  // 为什么取首条：会话内历史不断追加，但首条 user 消息在整段会话中恒定 → 同会话恒同键；
  // 用户开新会话（首条消息不同）→ 自然换键。
@@ -615,10 +600,10 @@ index 8fb4ea6..7763d3a 100644
  	uid8 := uid
  	if len(uid8) > 8 {
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index 4c1ccc6..e1076da 100644
+index f749ba3..2c68953 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
-@@ -907,7 +907,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
+@@ -914,7 +914,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
  // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
  // 显式传 realm 使 effort 降级按域取桶：CN 探测信息不得作用到 global 请求（C-2）。
  // conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；
@@ -627,7 +612,7 @@ index 4c1ccc6..e1076da 100644
  func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
  	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
  	if realmKey(realm) == "global" {
-@@ -1220,7 +1220,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+@@ -1227,7 +1227,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
  	// ensureConsoleSystem 在 prepareBody 后统一套用全局脚本：首条消息非 system 时前置
  	// 兜底 system（防 console 域上游 code 11-128；#119 后 global 出站固定 /v2，
  	// 该兜底保留——上游对 /v2 是否需要 system 无实测反证，删了无回滚路径）。
@@ -653,10 +638,10 @@ index 1fee48b..735fe92 100644
  	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
  	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
 diff --git a/internal/upstream/sse.go b/internal/upstream/sse.go
-index 49410a0..e39c64c 100644
+index db2452e..c61f58c 100644
 --- a/internal/upstream/sse.go
 +++ b/internal/upstream/sse.go
-@@ -262,7 +262,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
+@@ -279,7 +279,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
  		// completion_tokens（部分上游末帧缺 total），网关合成补齐——否则严格按
  		// schema 校验的客户端收不到 total_tokens。已有 total 或二者缺一不补
  		// （不臆造：单边有值无法合成可信的 total）。
@@ -665,7 +650,7 @@ index 49410a0..e39c64c 100644
  	}
  	return resp, nil
  }
-@@ -455,6 +455,9 @@ func normalizeFrame(obj map[string]any) map[string]any {
+@@ -472,6 +472,9 @@ func normalizeFrame(obj map[string]any) map[string]any {
  		out["choices"] = nchs
  	}
  	if u, ok := obj["usage"]; ok {
