@@ -198,10 +198,10 @@ index 5fb8dbd..83b30c5 100644
  func TestBlockModelBackoffPickSkips(t *testing.T) {
  	withNoPickGap(t)
 diff --git a/internal/server/handler.go b/internal/server/handler.go
-index 073d8fa..06daae1 100644
+index d804e38..6494504 100644
 --- a/internal/server/handler.go
 +++ b/internal/server/handler.go
-@@ -908,8 +908,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+@@ -926,8 +926,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
  			continue
  		}
  		h.cfg.Pool.NoteSuccess(acct.UID)
@@ -212,7 +212,7 @@ index 073d8fa..06daae1 100644
  		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
  		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
  		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-@@ -1063,10 +1063,11 @@ func rotateBackoff(i int, ctx context.Context) bool {
+@@ -1088,10 +1088,11 @@ func rotateBackoff(i int, ctx context.Context) bool {
  //
  // 十条路径，各司其职：
  //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
@@ -228,7 +228,7 @@ index 073d8fa..06daae1 100644
  //   - ErrWafBlock → 账号级软冷却（WAF 403 修复 P0-1）：**不 Disable**——WAF 403 是
  //     IP/指纹维频控信号（报告 §6：双账号 403 后账号本身健康），罚过即走、到期自愈。
  //     时长优先 Retry-After 头（P1-2）；缺失按 wafCooldownBase(60s) 起 · 2^softStreak
-@@ -1129,18 +1130,33 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+@@ -1156,18 +1157,33 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
  		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」，无论业务
  		// code 是 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不
  		// softStreak 指数堆加。
@@ -367,10 +367,10 @@ index 776c3e5..eab6f1b 100644
  // 粘性号 A 被冷却（快照陈旧判 available），Session 层仍会返回 A 作为建议 uid；
  // 但真正的可用性权威闸是 handler 的 Pool.PickByUIDForModel（锁内新鲜判定
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index e1076da..f71395b 100644
+index 519515c..c7316f2 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
-@@ -338,6 +338,28 @@ func IsModelRateLimit(body string) bool {
+@@ -357,6 +357,28 @@ func IsModelRateLimit(body string) bool {
  	return reModelRateLimit.MatchString(body)
  }
  
@@ -400,19 +400,10 @@ index e1076da..f71395b 100644
  const modelBlockCode = "11102"
  
 diff --git a/internal/upstream/client_test.go b/internal/upstream/client_test.go
-index 7681b73..3ec9497 100644
+index ceb1dca..d4df218 100644
 --- a/internal/upstream/client_test.go
 +++ b/internal/upstream/client_test.go
-@@ -148,7 +148,7 @@ func TestIsWafBlocked(t *testing.T) {
- 	}{
- 		{403, "", true},
- 		{403, "<html>blocked</html>", true},
--		{403, `{"code":1}`, false},               // 有 "code": 字段
-+		{403, `{"code":1}`, false},                // 有 "code": 字段
- 		{403, `{"msg":"request illegal"}`, false}, // 有 "msg": 字段（且该文案本就该走 accountFault）
- 		{402, "", false},                          // 非 403
- 		{429, "", false},
-@@ -305,6 +305,31 @@ func TestIsModelRateLimit(t *testing.T) {
+@@ -311,6 +311,31 @@ func TestIsModelRateLimit(t *testing.T) {
  	}
  }
  
