@@ -1,5 +1,5 @@
 diff --git a/internal/pool/cooldown.go b/internal/pool/cooldown.go
-index df0ed43..647c33d 100644
+index e0f14b2..9fb05c0 100644
 --- a/internal/pool/cooldown.go
 +++ b/internal/pool/cooldown.go
 @@ -109,6 +109,59 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
@@ -90,11 +90,11 @@ index df0ed43..647c33d 100644
  	}
  	delete(e.modelCooldowns, model)
 diff --git a/internal/pool/entry.go b/internal/pool/entry.go
-index 6c5edf9..7917734 100644
+index ab1b473..2cb7181 100644
 --- a/internal/pool/entry.go
 +++ b/internal/pool/entry.go
-@@ -483,6 +483,16 @@ const (
- 	modelBlockShift   = 6 // 2^6=64 倍后封顶：6h×64>24h，实际封顶锚定 24h
+@@ -488,6 +488,16 @@ const (
+ 	modelBlockShift   = 6 // 2^6=64 倍后封顶：2m×64>10m，实际封顶锚定 10m
  )
  
 +// 14003「too many requests / Model busy」的模型级短退避参数。
@@ -111,7 +111,7 @@ index 6c5edf9..7917734 100644
  // 12153 会被临时性触发（网络抖动/上游闪断/refresh 竞态），一次失败即禁用的旧行为
  // 会误杀健康账号（P0-1：13 个 disabled 号全是误判）。3 次连续才判死：容忍偶发抖动，
 diff --git a/internal/pool/modelcooldown_test.go b/internal/pool/modelcooldown_test.go
-index 5fb8dbd..83b30c5 100644
+index 83f499a..98c32df 100644
 --- a/internal/pool/modelcooldown_test.go
 +++ b/internal/pool/modelcooldown_test.go
 @@ -754,6 +754,82 @@ func TestBlockModelClear6004NotClearedByPrefix(t *testing.T) {
@@ -198,10 +198,10 @@ index 5fb8dbd..83b30c5 100644
  func TestBlockModelBackoffPickSkips(t *testing.T) {
  	withNoPickGap(t)
 diff --git a/internal/server/handler.go b/internal/server/handler.go
-index d804e38..6494504 100644
+index 973b72f..d0aedfe 100644
 --- a/internal/server/handler.go
 +++ b/internal/server/handler.go
-@@ -926,8 +926,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+@@ -972,8 +972,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
  			continue
  		}
  		h.cfg.Pool.NoteSuccess(acct.UID)
@@ -212,7 +212,7 @@ index d804e38..6494504 100644
  		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
  		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
  		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-@@ -1088,10 +1088,11 @@ func rotateBackoff(i int, ctx context.Context) bool {
+@@ -1134,10 +1134,11 @@ func rotateBackoff(i int, ctx context.Context) bool {
  //
  // 十条路径，各司其职：
  //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
@@ -228,7 +228,7 @@ index d804e38..6494504 100644
  //   - ErrWafBlock → 账号级软冷却（WAF 403 修复 P0-1）：**不 Disable**——WAF 403 是
  //     IP/指纹维频控信号（报告 §6：双账号 403 后账号本身健康），罚过即走、到期自愈。
  //     时长优先 Retry-After 头（P1-2）；缺失按 wafCooldownBase(60s) 起 · 2^softStreak
-@@ -1156,18 +1157,33 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+@@ -1202,18 +1203,33 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
  		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」，无论业务
  		// code 是 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不
  		// softStreak 指数堆加。
@@ -367,10 +367,10 @@ index 776c3e5..eab6f1b 100644
  // 粘性号 A 被冷却（快照陈旧判 available），Session 层仍会返回 A 作为建议 uid；
  // 但真正的可用性权威闸是 handler 的 Pool.PickByUIDForModel（锁内新鲜判定
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index 519515c..c7316f2 100644
+index 2b5fe5f..6d9816a 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
-@@ -357,6 +357,28 @@ func IsModelRateLimit(body string) bool {
+@@ -358,6 +358,28 @@ func IsModelRateLimit(body string) bool {
  	return reModelRateLimit.MatchString(body)
  }
  
@@ -400,7 +400,7 @@ index 519515c..c7316f2 100644
  const modelBlockCode = "11102"
  
 diff --git a/internal/upstream/client_test.go b/internal/upstream/client_test.go
-index ceb1dca..d4df218 100644
+index ba68600..c2a20c7 100644
 --- a/internal/upstream/client_test.go
 +++ b/internal/upstream/client_test.go
 @@ -311,6 +311,31 @@ func TestIsModelRateLimit(t *testing.T) {

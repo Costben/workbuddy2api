@@ -1,8 +1,8 @@
 diff --git a/internal/server/handler.go b/internal/server/handler.go
-index c198049..b774ebc 100644
+index 59faa63..945823f 100644
 --- a/internal/server/handler.go
 +++ b/internal/server/handler.go
-@@ -1239,6 +1239,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+@@ -1284,6 +1284,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
  	case upstream.ErrImageInvalid:
  		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
  		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
@@ -77,10 +77,10 @@ index 27683c0..4c0df31 100644
  		})
  	}
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index a54af5b..ad779d8 100644
+index 1455e34..c4a82e9 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
-@@ -57,6 +57,9 @@ const (
+@@ -58,6 +58,9 @@ const (
  	// 一次误判就是永久杀号。故单列一类，由 handler 走「连续 N 次才禁用」的计数
  	// 路径（与 12153 的 NoteSessionDead 同口径、共用计数器）。
  	ErrAuthRejected
@@ -90,7 +90,7 @@ index a54af5b..ad779d8 100644
  )
  
  func (k ErrKind) String() string {
-@@ -93,6 +96,8 @@ func (k ErrKind) String() string {
+@@ -94,6 +97,8 @@ func (k ErrKind) String() string {
  		return "fallback_model_missing"
  	case ErrAuthRejected:
  		return "auth_rejected"
@@ -99,7 +99,7 @@ index a54af5b..ad779d8 100644
  	case ErrClient:
  		return "client"
  	default:
-@@ -298,6 +303,24 @@ func isPromptTooLongStatus(status int) bool {
+@@ -299,6 +304,24 @@ func isPromptTooLongStatus(status int) bool {
  		status == http.StatusRequestEntityTooLarge
  }
  
@@ -124,7 +124,7 @@ index a54af5b..ad779d8 100644
  // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
  // 与容器时区无关）。
  var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
-@@ -665,6 +688,12 @@ func Classify(status int, body string) ErrKind {
+@@ -666,6 +689,12 @@ func Classify(status int, body string) ErrKind {
  	if isPromptTooLongStatus(status) && promptTooLongRule.hit(body, lower) {
  		return ErrPromptTooLong
  	}

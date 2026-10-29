@@ -1,8 +1,8 @@
 diff --git a/cmd/server/config.go b/cmd/server/config.go
-index f483e0e..da2ce4d 100644
+index b6e0820..254f41d 100644
 --- a/cmd/server/config.go
 +++ b/cmd/server/config.go
-@@ -163,9 +163,10 @@ type Config struct {
+@@ -175,9 +175,10 @@ type Config struct {
  	} `json:"pool"`
  
  	SessionSticky struct {
@@ -16,7 +16,7 @@ index f483e0e..da2ce4d 100644
  	} `json:"session_sticky"`
  
  	// 解析后
-@@ -178,6 +179,7 @@ type Config struct {
+@@ -190,6 +191,7 @@ type Config struct {
  	DegradeCooldownMaxD time.Duration `json:"-"`
  	SessionTTL          time.Duration `json:"-"`
  	SessionGCInterval   time.Duration `json:"-"`
@@ -24,7 +24,7 @@ index f483e0e..da2ce4d 100644
  	ExpiringSoonDur     time.Duration `json:"-"`
  	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
  	CostExploreIntervalDur time.Duration `json:"-"`
-@@ -231,6 +233,7 @@ func Default() *Config {
+@@ -245,6 +247,7 @@ func Default() *Config {
  	c.SessionSticky.Enabled = true
  	c.SessionSticky.TTL = "30m"
  	c.SessionSticky.GCInterval = "5m"
@@ -32,7 +32,7 @@ index f483e0e..da2ce4d 100644
  	return c
  }
  
-@@ -420,6 +423,12 @@ func (c *Config) normalize() error {
+@@ -439,6 +442,12 @@ func (c *Config) normalize() error {
  	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
  		return fmt.Errorf("session_sticky.gc_interval: %w", err)
  	}
@@ -46,7 +46,7 @@ index f483e0e..da2ce4d 100644
  		c.Pool.BreakerThreshold = 3
  	}
 diff --git a/cmd/server/main.go b/cmd/server/main.go
-index d6a9e29..83bea50 100644
+index 831617b..9f48be0 100644
 --- a/cmd/server/main.go
 +++ b/cmd/server/main.go
 @@ -122,7 +122,8 @@ func main() {
@@ -59,7 +59,7 @@ index d6a9e29..83bea50 100644
  		})
  		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
  		sessRouter.StartGC()
-@@ -231,6 +232,7 @@ func main() {
+@@ -240,6 +241,7 @@ func main() {
  		Upstream:     up,
  		APIKey:       cfg.APIKey,
  		Session:      sessRouter,
@@ -94,10 +94,10 @@ index 51f762d..f3cff9f 100644
 +	}
 +}
 diff --git a/config.example.json b/config.example.json
-index 9e0ba20..b35660a 100644
+index 5daa5fa..07e7b3b 100644
 --- a/config.example.json
 +++ b/config.example.json
-@@ -83,6 +83,7 @@
+@@ -85,6 +85,7 @@
    "session_sticky": {
      "enabled": true,
      "ttl": "30m",
@@ -335,7 +335,7 @@ index 0000000..5714ef8
 +	}
 +}
 diff --git a/internal/server/handler.go b/internal/server/handler.go
-index b774ebc..d804e38 100644
+index 945823f..973b72f 100644
 --- a/internal/server/handler.go
 +++ b/internal/server/handler.go
 @@ -31,6 +31,8 @@ type Config struct {
@@ -347,7 +347,7 @@ index b774ebc..d804e38 100644
  	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
  	StickyCount func() int
  	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
-@@ -541,12 +543,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+@@ -542,12 +544,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
  	tried := map[string]bool{}
  	var lastErr error
  
@@ -362,7 +362,7 @@ index b774ebc..d804e38 100644
  	// stickyKey 是**粘性专用**键，与 sessKey（会话头族聚合用）分开：
  	// sessKey 为空时（OpenAI 兼容客户端——dsh / Codex 等既无 conversationId 也无
  	// metadata）用首条 user 消息派生会话级 fallback 键，使粘性仍能生效。
-@@ -660,6 +662,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+@@ -664,6 +666,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
  	//     里塞 conversationId —— #193 的剥离实测证明校验对象是头，body 那个字段不是
  	//     必填项。
  	chatMeta := upstream.ChatMeta{ConversationID: session.ConversationIDForHeaders(body, sessKey)}
@@ -373,7 +373,7 @@ index b774ebc..d804e38 100644
  	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
  		chatMeta.ConversationRequestID = v
  	} else if turnKey != "" && sessKey != "" {
-@@ -680,8 +686,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+@@ -685,8 +691,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
  	for i := 0; i < h.cfg.MaxRotate; i++ {
  		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
  		var acct *auth.Auth
@@ -400,7 +400,7 @@ index b774ebc..d804e38 100644
  			if acct == nil || (realm != "" && acct.Realm() != realm) {
  				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑。
  				unbindSticky()
-@@ -702,7 +725,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+@@ -726,7 +749,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
  		tried[acct.UID] = true
  
  		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
@@ -600,10 +600,10 @@ index 8fb4ea6..7763d3a 100644
  	uid8 := uid
  	if len(uid8) > 8 {
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index ad779d8..519515c 100644
+index c4a82e9..2b5fe5f 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
-@@ -933,7 +933,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
+@@ -948,7 +948,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
  // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
  // 显式传 realm 使 effort 降级按域取桶：CN 探测信息不得作用到 global 请求（C-2）。
  // conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；
@@ -612,7 +612,7 @@ index ad779d8..519515c 100644
  func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
  	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
  	if realmKey(realm) == "global" {
-@@ -1246,7 +1246,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+@@ -1261,7 +1261,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
  	// ensureConsoleSystem 在 prepareBody 后统一套用全局脚本：首条消息非 system 时前置
  	// 兜底 system（防 console 域上游 code 11-128；#119 后 global 出站固定 /v2，
  	// 该兜底保留——上游对 /v2 是否需要 system 无实测反证，删了无回滚路径）。
