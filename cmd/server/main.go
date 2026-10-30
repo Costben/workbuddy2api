@@ -180,6 +180,12 @@ func main() {
 	if scheduleSeed == "" {
 		scheduleSeed = cfg.AuthDir
 	}
+	// 周期余额刷新间隔（schedule.billing_interval，缺省 30m；billing_enabled=false 关闭）。
+	// Normalize 已校验过格式，这里的错误只可能是"配了非法值却绕过了 Normalize"。
+	billingEvery, billingErr := cfg.Schedule.BillingEvery()
+	if billingErr != nil {
+		log.Fatalf("schedule.billing_interval: %v", billingErr)
+	}
 	sch := scheduler.New(scheduler.Config{
 		AccountDelayMinSeconds: cfg.Schedule.AccountDelayMinSeconds,
 		AccountDelayMaxSeconds: cfg.Schedule.AccountDelayMaxSeconds,
@@ -201,6 +207,8 @@ func main() {
 		KeepaliveDisabled:      !cfg.Schedule.KeepaliveEnabled,
 		SchoolDisabled:         !cfg.Schedule.SchoolEnabled,
 		CatDisabled:            !cfg.Schedule.CatEnabled,
+		BillingInterval:        billingEvery,
+		BillingDisabled:        !cfg.Schedule.BillingEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -235,6 +243,11 @@ func main() {
 	} else {
 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
 	}
+	if !cfg.Schedule.BillingEnabled {
+		log.Printf("周期余额刷新已禁用（schedule.billing_enabled=false）：global 号余额只在签到轮更新")
+	} else {
+		log.Printf("周期余额刷新已启用：每 %s 刷一次 global 号余额（选号权重依赖它）", billingEvery)
+	}
 
 	h := server.NewHandler(server.Config{
 		Pool:         p,
@@ -256,6 +269,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	// 周期余额刷新独立于排程主循环：它不是"某个整点的任务"，而是每 N 分钟一次
+	// 的只读账本同步（关停随 ctx 一起退出）。
+	go sch.RunBilling(ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

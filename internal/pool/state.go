@@ -487,6 +487,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Realm:      e.a.Realm(),
 		Nickname:   e.a.Nickname,
 		Credits:    e.credits,
+		// 快过期子集与余额同源透出：选号权重里「快过期占比」是独立强权重项，
+		// 只看 credits 无法解释「为什么总选它」。
+		CreditsExpiring: e.creditsExpiring,
 		// Cooling 口径含连败降权（degradeUntil）：降权期账号不可选，运维在 /status
 		// 应看到它处于非健康态（CoolRemaining 取三截止最远者，与 healthy 或门同口径）。
 		Cooling:          now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),

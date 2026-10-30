@@ -33,7 +33,9 @@
     "activity_enabled": true,
     "keepalive_enabled": true,
     "school_enabled": true,
-    "cat_enabled": true
+    "cat_enabled": true,
+    "billing_interval": "30m",
+    "billing_enabled": true
   },
   "admin": {
     "enabled": false

@@ -6,7 +6,11 @@
 // 两个命令共用同一份定义，消除漂移源头。
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // Schedule 排程配置段（对应 config.json 的 "schedule" 对象）。
 //
@@ -40,6 +44,13 @@ type Schedule struct {
 	KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 	SchoolEnabled    bool `json:"school_enabled"`    // 缺省 true；false = 停开学季任务
 	CatEnabled       bool `json:"cat_enabled"`       // 缺省 true；false = 停夜猫子任务
+	// BillingInterval 周期余额刷新间隔（只刷 global 账号，见 scheduler.RunBilling）。
+	// 余额原本只在签到轮（9/21 点）刷新，两次之间最长 12 小时拿不到新数字；而选号
+	// 权重（credits / 快过期占比）完全依赖它，陈旧余额会让「积分多的号先烧」持续
+	// 打在已经快空的号上。空 = 30m；关闭请用 billing_enabled=false，不靠这个值。
+	BillingInterval string `json:"billing_interval"`
+	// BillingEnabled 显式关闭周期余额刷新（缺省 true）。
+	BillingEnabled bool `json:"billing_enabled"`
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int `json:"activity_report_count"`
@@ -66,6 +77,8 @@ func DefaultSchedule() Schedule {
 		KeepaliveEnabled:    true,
 		SchoolEnabled:       true,
 		CatEnabled:          true,
+		BillingInterval:     "30m",
+		BillingEnabled:      true,
 		ActivityReportCount: 5, // 领猫前置需 5 次对话，5 连发刷满 chat_5
 	}
 }
@@ -108,7 +121,29 @@ func (s *Schedule) Normalize() error {
 	if s.ActivityReportCount <= 0 {
 		s.ActivityReportCount = 1
 	}
+	// 余额刷新间隔：空 = 默认 30m；配了就必须合法且不低于 1 分钟——再短只是对
+	// billing 接口刷请求，收益为零、风控风险不为零。关闭一律走 billing_enabled。
+	if raw := strings.TrimSpace(s.BillingInterval); raw != "" {
+		if d, err := time.ParseDuration(raw); err != nil {
+			return fmt.Errorf("schedule.billing_interval: %q 不是合法时长（示例 \"30m\"）；要关闭请设 schedule.billing_enabled=false", raw)
+		} else if d < time.Minute {
+			return fmt.Errorf("schedule.billing_interval: %s 太短（最少 1m）；要关闭请设 schedule.billing_enabled=false", d)
+		}
+	}
 	return s.validateHours()
+}
+
+// BillingEvery 解析 schedule.billing_interval，返回周期余额刷新间隔。
+// 返回 0 表示不启用（schedule.billing_enabled=false）。
+func (s *Schedule) BillingEvery() (time.Duration, error) {
+	if !s.BillingEnabled {
+		return 0, nil
+	}
+	raw := strings.TrimSpace(s.BillingInterval)
+	if raw == "" {
+		return 30 * time.Minute, nil
+	}
+	return time.ParseDuration(raw)
 }
 
 // validateHours 校验排程小时落在 0-23。

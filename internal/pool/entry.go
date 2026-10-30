@@ -42,6 +42,10 @@ type Status struct {
 	Until         time.Time `json:"until,omitempty"`
 	Reason        string    `json:"reason,omitempty"`
 	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	// CreditsExpiring 快过期积分子集（到期窗口内，见 ExpiringSoonWindow）。
+	// 与 credits 一起透出：选号权重把「快过期占比」当独立强权重项，只看 credits
+	// 无法解释「为什么总选这个号」。
+	CreditsExpiring int64 `json:"credits_expiring"`
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。

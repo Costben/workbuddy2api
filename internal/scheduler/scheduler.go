@@ -56,6 +56,12 @@ type Config struct {
 	SchoolDisabled bool
 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
 	CatDisabled bool
+
+	// BillingInterval 周期余额刷新间隔（只刷 global 账号，见 RunBilling）。
+	// <=0 或 BillingDisabled 为真时该循环不启动——零值 Config 保持旧行为。
+	BillingInterval time.Duration
+	// BillingDisabled 显式关闭周期余额刷新（schedule.billing_enabled=false）。
+	BillingDisabled bool
 }
 
 // Scheduler 调度器。
@@ -369,6 +375,91 @@ func (s *Scheduler) Run(ctx context.Context) {
 		}
 		s.runBatch(ctx, kinds)
 		cursor = next
+	}
+}
+
+// billingFirstDelay 周期余额刷新的首刷延迟上限。
+//
+// 为什么不立刻刷：容器重启/崩溃循环时每次启动都打一轮 billing 就是给上游补证据；
+// 2 分钟足以让一次正常部署马上纠正余额，又与重启风暴错开（10 秒内起 5 次的环境
+// 实测存在，见 2026-10-30 的 auths 热加载抖动）。
+const billingFirstDelay = 2 * time.Minute
+
+// RunBilling 周期刷新 global 账号余额（只读 billing/meter，不碰签到）。
+//
+// 为什么需要它：余额原本只在签到轮（9/21 点）刷新，两次之间最长 12 小时。而选号
+// 权重里的 credits / 快过期占比完全靠这份数字，陈旧余额会让「积分多的号先烧」
+// 一直打在已经快空的号上（2026-10-30 实测：池里记 335/235，真实 303/81，权重按
+// 后者该给 3.7 倍差距，实际只给了 1.4 倍）。
+//
+// 只刷 global：CN 账号的余额由签到轮覆盖（签到成功即回填），再叠一条周期查询等于
+// 对 codebuddy.cn 双份请求，风控上不划算。global 没有签到体系，只读查询是唯一来源。
+func (s *Scheduler) RunBilling(ctx context.Context) {
+	if s.cfg.BillingDisabled || s.cfg.BillingInterval <= 0 || s.cfg.Pool == nil || s.cfg.Upstream == nil {
+		return
+	}
+	first := s.cfg.BillingInterval
+	if first > billingFirstDelay {
+		first = billingFirstDelay
+	}
+	if !sleepCtx(ctx, first) {
+		return
+	}
+	s.refreshGlobalCredits(ctx)
+	t := time.NewTicker(s.cfg.BillingInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.refreshGlobalCredits(ctx)
+		}
+	}
+}
+
+// refreshGlobalCredits 遍历 global 账号刷新余额账本（一次遍历 = 一个周期）。
+//
+// 只写账本，不做解冻：ReenableIfCredits 会清 429 软冷却与 6004 模型级冷却，周期
+// 刷新若每 30 分钟清一次，等于把上游刚给的限流信号抹掉——解冻仍归签到轮。
+func (s *Scheduler) refreshGlobalCredits(ctx context.Context) {
+	ctx = context.WithValue(ctx, scheduledAccountKey{}, true)
+	var okN, failN, skipN int
+	first := true
+	for _, st := range s.cfg.Pool.List() {
+		if ctx.Err() != nil {
+			return
+		}
+		if st.Disabled {
+			skipN++
+			continue
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || !a.IsGlobal() {
+			continue
+		}
+		if a.RefreshTokenValue() == "" {
+			skipN++
+			continue
+		}
+		// 相邻账号之间限速：只读查询同样打上游。
+		if !first {
+			if !sleepCtx(ctx, s.accountGap(ctx, checkinAccountDelay)) {
+				return
+			}
+		}
+		first = false
+		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+		if err != nil {
+			failN++
+			log.Printf("billing refresh %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+			continue
+		}
+		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
+		okN++
+	}
+	if okN+failN > 0 {
+		log.Printf("billing refresh: ok=%d fail=%d skipped=%d", okN, failN, skipN)
 	}
 }
 

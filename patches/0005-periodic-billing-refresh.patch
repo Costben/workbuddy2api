@@ -1,0 +1,482 @@
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index 9f48be0..d9af107 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -180,6 +180,12 @@ func main() {
+ 	if scheduleSeed == "" {
+ 		scheduleSeed = cfg.AuthDir
+ 	}
++	// 周期余额刷新间隔（schedule.billing_interval，缺省 30m；billing_enabled=false 关闭）。
++	// Normalize 已校验过格式，这里的错误只可能是"配了非法值却绕过了 Normalize"。
++	billingEvery, billingErr := cfg.Schedule.BillingEvery()
++	if billingErr != nil {
++		log.Fatalf("schedule.billing_interval: %v", billingErr)
++	}
+ 	sch := scheduler.New(scheduler.Config{
+ 		AccountDelayMinSeconds: cfg.Schedule.AccountDelayMinSeconds,
+ 		AccountDelayMaxSeconds: cfg.Schedule.AccountDelayMaxSeconds,
+@@ -201,6 +207,8 @@ func main() {
+ 		KeepaliveDisabled:      !cfg.Schedule.KeepaliveEnabled,
+ 		SchoolDisabled:         !cfg.Schedule.SchoolEnabled,
+ 		CatDisabled:            !cfg.Schedule.CatEnabled,
++		BillingInterval:        billingEvery,
++		BillingDisabled:        !cfg.Schedule.BillingEnabled,
+ 	})
+ 	switch {
+ 	case !cfg.Schedule.CheckinEnabled:
+@@ -235,6 +243,11 @@ func main() {
+ 	} else {
+ 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
+ 	}
++	if !cfg.Schedule.BillingEnabled {
++		log.Printf("周期余额刷新已禁用（schedule.billing_enabled=false）：global 号余额只在签到轮更新")
++	} else {
++		log.Printf("周期余额刷新已启用：每 %s 刷一次 global 号余额（选号权重依赖它）", billingEvery)
++	}
+ 
+ 	h := server.NewHandler(server.Config{
+ 		Pool:         p,
+@@ -256,6 +269,9 @@ func main() {
+ 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+ 	defer stop()
+ 	go sch.Run(ctx)
++	// 周期余额刷新独立于排程主循环：它不是"某个整点的任务"，而是每 N 分钟一次
++	// 的只读账本同步（关停随 ctx 一起退出）。
++	go sch.RunBilling(ctx)
+ 
+ 	srv := &http.Server{
+ 		Addr:              cfg.Listen,
+diff --git a/config.example.json b/config.example.json
+index 07e7b3b..381e3e6 100644
+--- a/config.example.json
++++ b/config.example.json
+@@ -33,7 +33,9 @@
+     "activity_enabled": true,
+     "keepalive_enabled": true,
+     "school_enabled": true,
+-    "cat_enabled": true
++    "cat_enabled": true,
++    "billing_interval": "30m",
++    "billing_enabled": true
+   },
+   "admin": {
+     "enabled": false
+diff --git a/internal/config/schedule.go b/internal/config/schedule.go
+index 73ac8cd..de31874 100644
+--- a/internal/config/schedule.go
++++ b/internal/config/schedule.go
+@@ -6,7 +6,11 @@
+ // 两个命令共用同一份定义，消除漂移源头。
+ package config
+ 
+-import "fmt"
++import (
++	"fmt"
++	"strings"
++	"time"
++)
+ 
+ // Schedule 排程配置段（对应 config.json 的 "schedule" 对象）。
+ //
+@@ -40,6 +44,13 @@ type Schedule struct {
+ 	KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
+ 	SchoolEnabled    bool `json:"school_enabled"`    // 缺省 true；false = 停开学季任务
+ 	CatEnabled       bool `json:"cat_enabled"`       // 缺省 true；false = 停夜猫子任务
++	// BillingInterval 周期余额刷新间隔（只刷 global 账号，见 scheduler.RunBilling）。
++	// 余额原本只在签到轮（9/21 点）刷新，两次之间最长 12 小时拿不到新数字；而选号
++	// 权重（credits / 快过期占比）完全依赖它，陈旧余额会让「积分多的号先烧」持续
++	// 打在已经快空的号上。空 = 30m；关闭请用 billing_enabled=false，不靠这个值。
++	BillingInterval string `json:"billing_interval"`
++	// BillingEnabled 显式关闭周期余额刷新（缺省 true）。
++	BillingEnabled bool `json:"billing_enabled"`
+ 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
+ 	// 默认 5 条把 chat_5 刷满；0/缺省=1 兼容旧行为。
+ 	ActivityReportCount int `json:"activity_report_count"`
+@@ -66,6 +77,8 @@ func DefaultSchedule() Schedule {
+ 		KeepaliveEnabled:    true,
+ 		SchoolEnabled:       true,
+ 		CatEnabled:          true,
++		BillingInterval:     "30m",
++		BillingEnabled:      true,
+ 		ActivityReportCount: 5, // 领猫前置需 5 次对话，5 连发刷满 chat_5
+ 	}
+ }
+@@ -108,9 +121,31 @@ func (s *Schedule) Normalize() error {
+ 	if s.ActivityReportCount <= 0 {
+ 		s.ActivityReportCount = 1
+ 	}
++	// 余额刷新间隔：空 = 默认 30m；配了就必须合法且不低于 1 分钟——再短只是对
++	// billing 接口刷请求，收益为零、风控风险不为零。关闭一律走 billing_enabled。
++	if raw := strings.TrimSpace(s.BillingInterval); raw != "" {
++		if d, err := time.ParseDuration(raw); err != nil {
++			return fmt.Errorf("schedule.billing_interval: %q 不是合法时长（示例 \"30m\"）；要关闭请设 schedule.billing_enabled=false", raw)
++		} else if d < time.Minute {
++			return fmt.Errorf("schedule.billing_interval: %s 太短（最少 1m）；要关闭请设 schedule.billing_enabled=false", d)
++		}
++	}
+ 	return s.validateHours()
+ }
+ 
++// BillingEvery 解析 schedule.billing_interval，返回周期余额刷新间隔。
++// 返回 0 表示不启用（schedule.billing_enabled=false）。
++func (s *Schedule) BillingEvery() (time.Duration, error) {
++	if !s.BillingEnabled {
++		return 0, nil
++	}
++	raw := strings.TrimSpace(s.BillingInterval)
++	if raw == "" {
++		return 30 * time.Minute, nil
++	}
++	return time.ParseDuration(raw)
++}
++
+ // validateHours 校验排程小时落在 0-23。
+ //
+ // 为什么不用 `[-1]` 之类的哨兵值表意"禁用"：非法小时被静默吞掉时，用户以为关掉了签到，
+diff --git a/internal/pool/entry.go b/internal/pool/entry.go
+index 2cb7181..87cd5cd 100644
+--- a/internal/pool/entry.go
++++ b/internal/pool/entry.go
+@@ -42,6 +42,10 @@ type Status struct {
+ 	Until         time.Time `json:"until,omitempty"`
+ 	Reason        string    `json:"reason,omitempty"`
+ 	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
++	// CreditsExpiring 快过期积分子集（到期窗口内，见 ExpiringSoonWindow）。
++	// 与 credits 一起透出：选号权重把「快过期占比」当独立强权重项，只看 credits
++	// 无法解释「为什么总选这个号」。
++	CreditsExpiring int64 `json:"credits_expiring"`
+ 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
+ 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
+ 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
+diff --git a/internal/pool/state.go b/internal/pool/state.go
+index 1637de1..cd18aef 100644
+--- a/internal/pool/state.go
++++ b/internal/pool/state.go
+@@ -487,6 +487,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
+ 		Realm:      e.a.Realm(),
+ 		Nickname:   e.a.Nickname,
+ 		Credits:    e.credits,
++		// 快过期子集与余额同源透出：选号权重里「快过期占比」是独立强权重项，
++		// 只看 credits 无法解释「为什么总选它」。
++		CreditsExpiring: e.creditsExpiring,
+ 		// Cooling 口径含连败降权（degradeUntil）：降权期账号不可选，运维在 /status
+ 		// 应看到它处于非健康态（CoolRemaining 取三截止最远者，与 healthy 或门同口径）。
+ 		Cooling:          now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
+diff --git a/internal/scheduler/billing_test.go b/internal/scheduler/billing_test.go
+new file mode 100644
+index 0000000..ac69108
+--- /dev/null
++++ b/internal/scheduler/billing_test.go
+@@ -0,0 +1,203 @@
++package scheduler
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/pool"
++	"workbuddy2api/internal/upstream"
++)
++
++// billingBody 拼一个符合上游信封（{code,msg,data}）的余额查询响应。
++// 信封外层不能省：doJSON 只取 data 字段，直接给 {"Response":...} 会被当成空 data，
++// 表现为 "resource parse: unexpected end of JSON input"。
++func billingBody(accounts string) string {
++	return `{"code":0,"msg":"","data":{"Response":{"Data":{"Accounts":[` + accounts + `]}}}}`
++}
++
++// billingFake 起一个只应答余额查询的假上游，返回调用计数。
++// 任何路径都回 200：global 的 billing 路径 404 时会再打一次 /v2 fallback，
++// 那会让「一次刷新 = 一次调用」的断言失真。
++func billingFake(t *testing.T, body string) (*httptest.Server, *atomic.Int32) {
++	t.Helper()
++	var calls atomic.Int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		calls.Add(1)
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, body)
++	}))
++	t.Cleanup(srv.Close)
++	return srv, &calls
++}
++
++// billingScheduler 组装一个只挂 fake 上游的调度器。
++func billingScheduler(srv *httptest.Server, p *pool.Pool, cfg Config) *Scheduler {
++	up := &upstream.Client{
++		HTTP: srv.Client(), ChatBaseCN: srv.URL,
++		BillingBaseCN: srv.URL, BillingBaseGlobal: srv.URL, GlobalEnabled: true,
++	}
++	cfg.Pool = p
++	cfg.Upstream = up
++	return New(cfg)
++}
++
++func globalAuth(uid string) *auth.Auth {
++	return &auth.Auth{UID: uid, Nickname: uid, AccessToken: "at", RefreshToken: "rt",
++		ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"}
++}
++
++// TestBillingRefreshWritesCreditsAndExpiring 周期刷新必须把「余额总量」与「快过期
++// 子集」一起写进账本——选号权重两项都用，只写总量等于快过期加成永远为 0。
++func TestBillingRefreshWritesCreditsAndExpiring(t *testing.T) {
++	// 一个 1 天后到期的套餐（窗口 7 天 → 计入 Expiring）+ 一个无到期套餐（Stable）。
++	// 上游时间字段是 UTC+8 墙钟（与 upstream.softRateResetLoc 同口径）。
++	cst := time.FixedZone("UTC+8", 8*60*60)
++	soon := time.Now().In(cst).Add(24 * time.Hour).Format("2006-01-02 15:04:05")
++	body := billingBody(`{"CapacityRemain":55,"CycleEndTime":"` + soon + `"},` +
++		`{"CapacityRemain":248}`)
++	srv, calls := billingFake(t, body)
++
++	p := pool.New("")
++	p.Add(globalAuth("g1"))
++	s := billingScheduler(srv, p, Config{ExpiringSoonWindow: 7 * 24 * time.Hour})
++
++	s.refreshGlobalCredits(context.Background())
++
++	if n := calls.Load(); n != 1 {
++		t.Fatalf("upstream calls=%d want 1（一账号一次只读查询）", n)
++	}
++	st := p.List()
++	if len(st) != 1 {
++		t.Fatalf("accounts=%d want 1", len(st))
++	}
++	if st[0].Credits != 303 {
++		t.Errorf("credits=%d want 303", st[0].Credits)
++	}
++	if st[0].CreditsExpiring != 55 {
++		t.Errorf("credits_expiring=%d want 55", st[0].CreditsExpiring)
++	}
++}
++
++// TestBillingRefreshSkipsCNAccounts CN 账号的余额由签到轮回填，周期刷新不得再打
++// 一次上游（双份请求只增加风控暴露，不增加信息）。
++func TestBillingRefreshSkipsCNAccounts(t *testing.T) {
++	srv, calls := billingFake(t, billingBody(`{"CapacityRemain":100}`))
++
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "c1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	s := billingScheduler(srv, p, Config{ExpiringSoonWindow: time.Hour})
++
++	s.refreshGlobalCredits(context.Background())
++
++	if n := calls.Load(); n != 0 {
++		t.Fatalf("upstream calls=%d want 0（CN 账号不在周期刷新范围内）", n)
++	}
++	if st := p.List(); st[0].Credits != 0 {
++		t.Errorf("credits=%d want 0（CN 账本不应被这条循环改写）", st[0].Credits)
++	}
++}
++
++// TestBillingRefreshDoesNotClearCooldowns 只写账本，不解冻：解冻会清 429 软冷却与
++// 6004 模型级冷却，周期刷新若每 30 分钟清一次，等于把上游刚给的限流信号抹掉。
++func TestBillingRefreshDoesNotClearCooldowns(t *testing.T) {
++	srv, _ := billingFake(t, billingBody(`{"CapacityRemain":500}`))
++
++	p := pool.New("")
++	p.Add(globalAuth("g1"))
++	p.Cooldown("g1", pool.CoolSoft, time.Hour, "429 rate limited")
++	s := billingScheduler(srv, p, Config{ExpiringSoonWindow: time.Hour})
++
++	s.refreshGlobalCredits(context.Background())
++
++	st := p.List()[0]
++	if st.Credits != 500 {
++		t.Errorf("credits=%d want 500（余额照写）", st.Credits)
++	}
++	if !st.Cooling {
++		t.Error("cooling=false want true（周期刷新不得解冻，解冻归签到轮）")
++	}
++}
++
++// TestBillingRefreshSurvivesUpstreamError 单个账号查询失败不影响其余账号，也不写账本。
++func TestBillingRefreshSurvivesUpstreamError(t *testing.T) {
++	var calls atomic.Int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if calls.Add(1) == 1 {
++			w.WriteHeader(http.StatusInternalServerError)
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, billingBody(`{"CapacityRemain":120}`))
++	}))
++	t.Cleanup(srv.Close)
++
++	p := pool.New("")
++	p.Add(globalAuth("g1"))
++	p.Add(globalAuth("g2"))
++	s := billingScheduler(srv, p, Config{ExpiringSoonWindow: time.Hour})
++
++	s.refreshGlobalCredits(context.Background())
++
++	// 一个失败、一个成功：成功的那个必须已写入，失败的那个保持原值。
++	st := p.List()
++	var got int64
++	for _, one := range st {
++		got += one.Credits
++	}
++	if got != 120 {
++		t.Errorf("sum(credits)=%d want 120（一个失败一个成功）", got)
++	}
++}
++
++// TestRunBillingDisabledReturnsImmediately billing_enabled=false（或间隔非正）时
++// 循环必须立刻退出，一次上游都不打——零值 Config 保持旧行为。
++func TestRunBillingDisabledReturnsImmediately(t *testing.T) {
++	srv, calls := billingFake(t, billingBody(`{"CapacityRemain":1}`))
++
++	for _, cfg := range []Config{{BillingDisabled: true, BillingInterval: time.Minute},
++		{BillingInterval: 0}} {
++		p := pool.New("")
++		p.Add(globalAuth("g1"))
++		s := billingScheduler(srv, p, cfg)
++
++		done := make(chan struct{})
++		go func() { s.RunBilling(context.Background()); close(done) }()
++		select {
++		case <-done:
++		case <-time.After(2 * time.Second):
++			t.Fatal("RunBilling 未在禁用时立刻返回")
++		}
++	}
++	if n := calls.Load(); n != 0 {
++		t.Errorf("upstream calls=%d want 0", n)
++	}
++}
++
++// TestRunBillingCancelsDuringFirstDelay ctx 取消时首刷延迟必须可打断（否则停机要
++// 等满 2 分钟）。
++func TestRunBillingCancelsDuringFirstDelay(t *testing.T) {
++	srv, calls := billingFake(t, billingBody(`{"CapacityRemain":1}`))
++	p := pool.New("")
++	p.Add(globalAuth("g1"))
++	s := billingScheduler(srv, p, Config{BillingInterval: time.Hour})
++
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan struct{})
++	go func() { s.RunBilling(ctx); close(done) }()
++	time.Sleep(50 * time.Millisecond)
++	cancel()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("RunBilling 未响应 ctx 取消")
++	}
++	if n := calls.Load(); n != 0 {
++		t.Errorf("upstream calls=%d want 0（首刷延迟内被取消）", n)
++	}
++}
+diff --git a/internal/scheduler/scheduler.go b/internal/scheduler/scheduler.go
+index 91fdabb..bdf34e7 100644
+--- a/internal/scheduler/scheduler.go
++++ b/internal/scheduler/scheduler.go
+@@ -56,6 +56,12 @@ type Config struct {
+ 	SchoolDisabled bool
+ 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
+ 	CatDisabled bool
++
++	// BillingInterval 周期余额刷新间隔（只刷 global 账号，见 RunBilling）。
++	// <=0 或 BillingDisabled 为真时该循环不启动——零值 Config 保持旧行为。
++	BillingInterval time.Duration
++	// BillingDisabled 显式关闭周期余额刷新（schedule.billing_enabled=false）。
++	BillingDisabled bool
+ }
+ 
+ // Scheduler 调度器。
+@@ -372,6 +378,91 @@ func (s *Scheduler) Run(ctx context.Context) {
+ 	}
+ }
+ 
++// billingFirstDelay 周期余额刷新的首刷延迟上限。
++//
++// 为什么不立刻刷：容器重启/崩溃循环时每次启动都打一轮 billing 就是给上游补证据；
++// 2 分钟足以让一次正常部署马上纠正余额，又与重启风暴错开（10 秒内起 5 次的环境
++// 实测存在，见 2026-10-30 的 auths 热加载抖动）。
++const billingFirstDelay = 2 * time.Minute
++
++// RunBilling 周期刷新 global 账号余额（只读 billing/meter，不碰签到）。
++//
++// 为什么需要它：余额原本只在签到轮（9/21 点）刷新，两次之间最长 12 小时。而选号
++// 权重里的 credits / 快过期占比完全靠这份数字，陈旧余额会让「积分多的号先烧」
++// 一直打在已经快空的号上（2026-10-30 实测：池里记 335/235，真实 303/81，权重按
++// 后者该给 3.7 倍差距，实际只给了 1.4 倍）。
++//
++// 只刷 global：CN 账号的余额由签到轮覆盖（签到成功即回填），再叠一条周期查询等于
++// 对 codebuddy.cn 双份请求，风控上不划算。global 没有签到体系，只读查询是唯一来源。
++func (s *Scheduler) RunBilling(ctx context.Context) {
++	if s.cfg.BillingDisabled || s.cfg.BillingInterval <= 0 || s.cfg.Pool == nil || s.cfg.Upstream == nil {
++		return
++	}
++	first := s.cfg.BillingInterval
++	if first > billingFirstDelay {
++		first = billingFirstDelay
++	}
++	if !sleepCtx(ctx, first) {
++		return
++	}
++	s.refreshGlobalCredits(ctx)
++	t := time.NewTicker(s.cfg.BillingInterval)
++	defer t.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-t.C:
++			s.refreshGlobalCredits(ctx)
++		}
++	}
++}
++
++// refreshGlobalCredits 遍历 global 账号刷新余额账本（一次遍历 = 一个周期）。
++//
++// 只写账本，不做解冻：ReenableIfCredits 会清 429 软冷却与 6004 模型级冷却，周期
++// 刷新若每 30 分钟清一次，等于把上游刚给的限流信号抹掉——解冻仍归签到轮。
++func (s *Scheduler) refreshGlobalCredits(ctx context.Context) {
++	ctx = context.WithValue(ctx, scheduledAccountKey{}, true)
++	var okN, failN, skipN int
++	first := true
++	for _, st := range s.cfg.Pool.List() {
++		if ctx.Err() != nil {
++			return
++		}
++		if st.Disabled {
++			skipN++
++			continue
++		}
++		a := s.cfg.Pool.AuthByUID(st.UID)
++		if a == nil || !a.IsGlobal() {
++			continue
++		}
++		if a.RefreshTokenValue() == "" {
++			skipN++
++			continue
++		}
++		// 相邻账号之间限速：只读查询同样打上游。
++		if !first {
++			if !sleepCtx(ctx, s.accountGap(ctx, checkinAccountDelay)) {
++				return
++			}
++		}
++		first = false
++		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
++		if err != nil {
++			failN++
++			log.Printf("billing refresh %s: %v", logfmt.Label(st.UID, st.Nickname), err)
++			continue
++		}
++		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
++		okN++
++	}
++	if okN+failN > 0 {
++		log.Printf("billing refresh: ok=%d fail=%d skipped=%d", okN, failN, skipN)
++	}
++}
++
+ // runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
+ // 供 Run 主循环与测试使用；ctx 取消时由各任务内部的 sleepCtx 快速收尾。
+ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
