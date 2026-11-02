@@ -1,8 +1,8 @@
 diff --git a/cmd/server/main.go b/cmd/server/main.go
-index 9f48be0..d9af107 100644
+index 7c21788..f7f297a 100644
 --- a/cmd/server/main.go
 +++ b/cmd/server/main.go
-@@ -180,6 +180,12 @@ func main() {
+@@ -183,6 +183,12 @@ func main() {
  	if scheduleSeed == "" {
  		scheduleSeed = cfg.AuthDir
  	}
@@ -15,7 +15,7 @@ index 9f48be0..d9af107 100644
  	sch := scheduler.New(scheduler.Config{
  		AccountDelayMinSeconds: cfg.Schedule.AccountDelayMinSeconds,
  		AccountDelayMaxSeconds: cfg.Schedule.AccountDelayMaxSeconds,
-@@ -201,6 +207,8 @@ func main() {
+@@ -204,6 +210,8 @@ func main() {
  		KeepaliveDisabled:      !cfg.Schedule.KeepaliveEnabled,
  		SchoolDisabled:         !cfg.Schedule.SchoolEnabled,
  		CatDisabled:            !cfg.Schedule.CatEnabled,
@@ -24,7 +24,7 @@ index 9f48be0..d9af107 100644
  	})
  	switch {
  	case !cfg.Schedule.CheckinEnabled:
-@@ -235,6 +243,11 @@ func main() {
+@@ -238,6 +246,11 @@ func main() {
  	} else {
  		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
  	}
@@ -35,8 +35,8 @@ index 9f48be0..d9af107 100644
 +	}
  
  	h := server.NewHandler(server.Config{
- 		Pool:         p,
-@@ -256,6 +269,9 @@ func main() {
+ 		Pool:                 p,
+@@ -261,6 +274,9 @@ func main() {
  	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
  	defer stop()
  	go sch.Run(ctx)
@@ -134,13 +134,13 @@ index 73ac8cd..de31874 100644
  //
  // 为什么不用 `[-1]` 之类的哨兵值表意"禁用"：非法小时被静默吞掉时，用户以为关掉了签到，
 diff --git a/internal/pool/entry.go b/internal/pool/entry.go
-index 2cb7181..87cd5cd 100644
+index f5a0cf0..9080dfe 100644
 --- a/internal/pool/entry.go
 +++ b/internal/pool/entry.go
-@@ -42,6 +42,10 @@ type Status struct {
- 	Until         time.Time `json:"until,omitempty"`
- 	Reason        string    `json:"reason,omitempty"`
- 	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+@@ -43,6 +43,10 @@ type Status struct {
+ 	Until         time.Time          `json:"until,omitempty"`
+ 	Reason        string             `json:"reason,omitempty"`
+ 	SoftStreak    int                `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 +	// CreditsExpiring 快过期积分子集（到期窗口内，见 ExpiringSoonWindow）。
 +	// 与 credits 一起透出：选号权重把「快过期占比」当独立强权重项，只看 credits
 +	// 无法解释「为什么总选这个号」。
@@ -149,10 +149,10 @@ index 2cb7181..87cd5cd 100644
  	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
  	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 diff --git a/internal/pool/state.go b/internal/pool/state.go
-index 1637de1..cd18aef 100644
+index bfe3a4f..38d85fa 100644
 --- a/internal/pool/state.go
 +++ b/internal/pool/state.go
-@@ -487,6 +487,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
+@@ -488,6 +488,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
  		Realm:      e.a.Realm(),
  		Nickname:   e.a.Nickname,
  		Credits:    e.credits,
@@ -161,7 +161,7 @@ index 1637de1..cd18aef 100644
 +		CreditsExpiring: e.creditsExpiring,
  		// Cooling 口径含连败降权（degradeUntil）：降权期账号不可选，运维在 /status
  		// 应看到它处于非健康态（CoolRemaining 取三截止最远者，与 healthy 或门同口径）。
- 		Cooling:          now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
+ 		Cooling:          now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil) || e.refreshRiskActive(now),
 diff --git a/internal/scheduler/billing_test.go b/internal/scheduler/billing_test.go
 new file mode 100644
 index 0000000..ac69108
@@ -372,7 +372,7 @@ index 0000000..ac69108
 +	}
 +}
 diff --git a/internal/scheduler/scheduler.go b/internal/scheduler/scheduler.go
-index 91fdabb..bdf34e7 100644
+index ea2116e..0b088b4 100644
 --- a/internal/scheduler/scheduler.go
 +++ b/internal/scheduler/scheduler.go
 @@ -56,6 +56,12 @@ type Config struct {

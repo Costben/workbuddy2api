@@ -90,10 +90,10 @@ index e0f14b2..9fb05c0 100644
  	}
  	delete(e.modelCooldowns, model)
 diff --git a/internal/pool/entry.go b/internal/pool/entry.go
-index ab1b473..2cb7181 100644
+index 478caf5..f5a0cf0 100644
 --- a/internal/pool/entry.go
 +++ b/internal/pool/entry.go
-@@ -488,6 +488,16 @@ const (
+@@ -491,6 +491,16 @@ const (
  	modelBlockShift   = 6 // 2^6=64 倍后封顶：2m×64>10m，实际封顶锚定 10m
  )
  
@@ -198,10 +198,10 @@ index 83f499a..98c32df 100644
  func TestBlockModelBackoffPickSkips(t *testing.T) {
  	withNoPickGap(t)
 diff --git a/internal/server/handler.go b/internal/server/handler.go
-index 973b72f..d0aedfe 100644
+index 7057311..571d8e3 100644
 --- a/internal/server/handler.go
 +++ b/internal/server/handler.go
-@@ -972,8 +972,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+@@ -1058,8 +1058,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
  			continue
  		}
  		h.cfg.Pool.NoteSuccess(acct.UID)
@@ -212,7 +212,7 @@ index 973b72f..d0aedfe 100644
  		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
  		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
  		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-@@ -1134,10 +1134,11 @@ func rotateBackoff(i int, ctx context.Context) bool {
+@@ -1220,10 +1220,11 @@ func rotateBackoff(i int, ctx context.Context) bool {
  //
  // 十条路径，各司其职：
  //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
@@ -228,7 +228,7 @@ index 973b72f..d0aedfe 100644
  //   - ErrWafBlock → 账号级软冷却（WAF 403 修复 P0-1）：**不 Disable**——WAF 403 是
  //     IP/指纹维频控信号（报告 §6：双账号 403 后账号本身健康），罚过即走、到期自愈。
  //     时长优先 Retry-After 头（P1-2）；缺失按 wafCooldownBase(60s) 起 · 2^softStreak
-@@ -1202,18 +1203,33 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+@@ -1288,18 +1289,33 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
  		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」，无论业务
  		// code 是 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不
  		// softStreak 指数堆加。
@@ -367,7 +367,7 @@ index 776c3e5..eab6f1b 100644
  // 粘性号 A 被冷却（快照陈旧判 available），Session 层仍会返回 A 作为建议 uid；
  // 但真正的可用性权威闸是 handler 的 Pool.PickByUIDForModel（锁内新鲜判定
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index 2b5fe5f..6d9816a 100644
+index 2c783b0..59b89bf 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
 @@ -358,6 +358,28 @@ func IsModelRateLimit(body string) bool {
