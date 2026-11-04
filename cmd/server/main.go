@@ -253,18 +253,21 @@ func main() {
 	}
 
 	h := server.NewHandler(server.Config{
-		Pool:                 p,
-		Upstream:             up,
-		APIKey:               cfg.APIKey,
-		Session:              sessRouter,
-		StickyCount:          sessCount,
-		RedisMode:            redisMode,
-		SoftCooldown:         cfg.SoftRateDur,
-		LargeRequestBytes:    cfg.Pool.LargeRequestBytes,
-		LargeRequestCooldown: cfg.LargeRequestCooldownDur,
-		PromptMode:           cfg.Prompt.Mode,
-		PromptText:           cfg.PromptText,
-		StickyWait:           cfg.SessionWaitTimeout,
+		Pool:                     p,
+		Upstream:                 up,
+		APIKey:                   cfg.APIKey,
+		Session:                  sessRouter,
+		StickyCount:              sessCount,
+		RedisMode:                redisMode,
+		SoftCooldown:             cfg.SoftRateDur,
+		LargeRequestBytes:        cfg.Pool.LargeRequestBytes,
+		LargeRequestCooldown:     cfg.LargeRequestCooldownDur,
+		LargeRequestBudget:       cfg.Pool.LargeRequestBudget,
+		LargeRequestBudgetWindow: cfg.LargeRequestBudgetWindowDur,
+		StickyWait:               cfg.SessionWaitTimeout,
+		CreditFloor:              cfg.Pool.CreditFloor,
+		PromptMode:               cfg.Prompt.Mode,
+		PromptText:               cfg.PromptText,
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 运维管理端点开关（config admin.enabled，默认 false）。
