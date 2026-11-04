@@ -1,5 +1,5 @@
 diff --git a/cmd/server/main.go b/cmd/server/main.go
-index 7c21788..f7f297a 100644
+index a7c0b3f..6cdfa69 100644
 --- a/cmd/server/main.go
 +++ b/cmd/server/main.go
 @@ -183,6 +183,12 @@ func main() {
@@ -35,8 +35,8 @@ index 7c21788..f7f297a 100644
 +	}
  
  	h := server.NewHandler(server.Config{
- 		Pool:                 p,
-@@ -261,6 +274,9 @@ func main() {
+ 		Pool:                     p,
+@@ -264,6 +277,9 @@ func main() {
  	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
  	defer stop()
  	go sch.Run(ctx)
@@ -149,10 +149,10 @@ index f5a0cf0..9080dfe 100644
  	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
  	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 diff --git a/internal/pool/state.go b/internal/pool/state.go
-index bfe3a4f..38d85fa 100644
+index 87e16e2..be2656d 100644
 --- a/internal/pool/state.go
 +++ b/internal/pool/state.go
-@@ -488,6 +488,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
+@@ -493,6 +493,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
  		Realm:      e.a.Realm(),
  		Nickname:   e.a.Nickname,
  		Credits:    e.credits,
