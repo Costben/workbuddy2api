@@ -33,6 +33,11 @@ type Pool struct {
 	// 除非没有别的候选（否则阈值设高会直接 503）。`credits > 0` 才判断 —— 0 同时
 	// 表示「还没同步到余额」，启动时不能因此把整池排除。0 = 关闭（默认）。
 	creditFloor int64
+	// modelCreditGate 模型级积分门槛：key = 模型名（选号传入的裸名，如
+	// "deepseek-v4.1-flash-sg"），value = 最低积分。与 creditFloor 的区别是作用域：
+	// 门槛只把低分号踢出**指定模型**的候选集，其它模型完全不受影响 —— 这是
+	// 「某个模型烧积分狠、又不该拖累免费模型」时的唯一可用旋钮。空 map = 关闭。
+	modelCreditGate map[string]int64
 	// costExploreInterval costTier 条件探索窗口（issue #136 方案 a′，SetCostExploreInterval
 	// 注入；默认 defaultCostExploreInterval 30m）。tier 0 垄断 + tier 1 存在且距上次
 	// 探索 ≥ 窗口时，本次 pick 生效层切 tier 1-only（探索=搭车改道，零新增上游请求）。
@@ -155,6 +160,50 @@ func (p *Pool) creditFloorOKLocked(e *entry) bool {
 		return true
 	}
 	return e.credits >= p.creditFloor
+}
+
+// SetModelCreditGate 设置模型级积分门槛：低于门槛的账号只退出**该模型**的候选集，
+// 其它模型照常被选中（与 SetCreditFloor 的账号级语义严格区分）。
+// 门槛为 0/负、模型名为空的条目直接丢弃（等价于关闭该条）。
+func (p *Pool) SetModelCreditGate(gate map[string]int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(gate) == 0 {
+		p.modelCreditGate = nil
+		return
+	}
+	g := make(map[string]int64, len(gate))
+	for model, floor := range gate {
+		if model != "" && floor > 0 {
+			g[model] = floor
+		}
+	}
+	if len(g) == 0 {
+		p.modelCreditGate = nil
+		return
+	}
+	p.modelCreditGate = g
+}
+
+// modelCreditOKLocked 该账号余额是否够接 reqModel。
+//
+// 与 creditFloorOKLocked 有一处**故意的语义差异**：这里 `credits == 0` 算「不足」，
+// 而不是「未知放行」。原因：模型级门槛是硬隔离（「不给低分号接这个模型」），把未
+// 同步到的 0 当作放行，等于每次重启后用 0 分号先打一轮 402，把账号再打成硬冷却；
+// 而 global 号的余额由 RunBilling 周期刷新（首刷 2 分钟、此后 30 分钟），短暂不接
+// 这个模型是可以接受的代价。账号级 creditFloor 保持「未知放行」不动。
+//
+// 模型名不匹配（含 reqModel 为空、门槛 <= 0）时恒 true，不影响其它模型。
+// 调用方必须已持有 p.mu。
+func (p *Pool) modelCreditOKLocked(e *entry, reqModel string) bool {
+	if reqModel == "" || len(p.modelCreditGate) == 0 {
+		return true
+	}
+	floor, ok := p.modelCreditGate[reqModel]
+	if !ok || floor <= 0 {
+		return true
+	}
+	return e.credits >= floor
 }
 
 // SetCostExploreInterval 注入 costTier 条件探索窗口（main 从 config 解析后调用，

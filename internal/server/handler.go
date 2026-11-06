@@ -69,6 +69,10 @@ type Config struct {
 	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
 	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
 	AdminEnabled bool
+
+	// ModelCreditGate 模型级积分门槛：低于门槛的账号只退出该模型的候选集。
+	// 与 CreditFloor 的账号级语义互不影响（可同时使用）。
+	ModelCreditGate map[string]int64
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -188,6 +192,7 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.Pool != nil {
 		cfg.Pool.SetCreditFloor(cfg.CreditFloor)
+		cfg.Pool.SetModelCreditGate(cfg.ModelCreditGate)
 	}
 	if cfg.LargeRequestBytes == 0 {
 		cfg.LargeRequestBytes = 2 << 20 // 2 MiB ≈ 52 万 token：只切接近封号画像量级的超大上下文

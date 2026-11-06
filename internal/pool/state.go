@@ -359,6 +359,11 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	if !p.creditFloorOKLocked(e) {
 		return nil
 	}
+	// 模型级积分门槛同理，且更硬：低分号连「被粘住」都不允许，否则 SG 流量会
+	// 沿着会话绑定持续压在已烧空的号上，正常选号里的门槛完全绕开。
+	if !p.modelCreditOKLocked(e, model) {
+		return nil
+	}
 	e.lastUsed = now
 	// 粘性路径同样推进 usedSeq/pickSeq：粘性重度使用的账号在 LRU 兜底
 	// （pick 按 usedSeq 选最旧）眼中不再是"最旧"，与 pick 的严格全序语义对齐

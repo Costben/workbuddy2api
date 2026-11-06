@@ -162,12 +162,17 @@ type Config struct {
 		LargeRequestBudget int `json:"large_request_budget"`
 		// LargeRequestBudgetWindow 预算的滑动窗口，默认 "120s"。
 		LargeRequestBudgetWindow string `json:"large_request_budget_window"`
-		CreditFloor              int64  `json:"credit_floor"`         // 保底积分（issue #364）：低于该值的账号只作最后候选，0 = 关闭
-		MaxInFlight              int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
-		MaxInFlightGlobal        int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
-		BreakerThreshold         int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
-		BreakerCooldown          string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
-		BreakerCooldownMax       string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		CreditFloor              int64  `json:"credit_floor"` // 保底积分（issue #364）：低于该值的账号只作最后候选，0 = 关闭
+		// ModelCreditGate 模型级积分门槛：key 为模型名，value 为最低积分。低于门槛的
+		// 账号只退出该模型的候选集，其它模型照常服务（账号级 credit_floor 做不到这点：
+		// 它一压就压全池，免费号会被一起摘掉）。用途示例：SG 模型只要积分 >= 100 的号，
+		// 低分号继续跑不受限的免费模型。0 = 关闭。
+		ModelCreditGate    map[string]int64 `json:"model_credit_gate"`
+		MaxInFlight        int              `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal  int              `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
+		BreakerThreshold   int              `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+		BreakerCooldown    string           `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+		BreakerCooldownMax string           `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
 		// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）：
 		// ErrClient/传输层这类「不罚号」失败连续计数，达阈临时出池。与冷却/熔断
 		// 并存取更长者不叠加。默认 5 次 / 10m。
@@ -471,6 +476,21 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
+	}
+	// 模型级积分门槛：空模型名与非正门槛都是在库里无意义、在选号里等价于「关闭」
+	// 的条目，进池前先剔掉，避免每次 pick 都做一次无效 map 查找。
+	if len(c.Pool.ModelCreditGate) > 0 {
+		gate := make(map[string]int64, len(c.Pool.ModelCreditGate))
+		for model, floor := range c.Pool.ModelCreditGate {
+			if model != "" && floor > 0 {
+				gate[model] = floor
+			}
+		}
+		if len(gate) == 0 {
+			c.Pool.ModelCreditGate = nil
+		} else {
+			c.Pool.ModelCreditGate = gate
+		}
 	}
 	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
 		return fmt.Errorf("session_sticky.ttl: %w", err)

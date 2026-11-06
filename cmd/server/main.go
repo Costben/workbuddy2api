@@ -272,6 +272,8 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 运维管理端点开关（config admin.enabled，默认 false）。
 		AdminEnabled: cfg.Admin.Enabled,
+		// 模型级积分门槛（SG 只从余额够的号里选），与账号级 credit_floor 正交。
+		ModelCreditGate: cfg.Pool.ModelCreditGate,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
