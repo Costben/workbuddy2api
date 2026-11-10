@@ -1,0 +1,369 @@
+diff --git a/cmd/server/config.go b/cmd/server/config.go
+index 3cee956..b707c39 100644
+--- a/cmd/server/config.go
++++ b/cmd/server/config.go
+@@ -165,12 +165,17 @@ type Config struct {
+ 		LargeRequestBudget int `json:"large_request_budget"`
+ 		// LargeRequestBudgetWindow 预算的滑动窗口，默认 "120s"。
+ 		LargeRequestBudgetWindow string `json:"large_request_budget_window"`
+-		CreditFloor              int64  `json:"credit_floor"`         // 保底积分（issue #364）：低于该值的账号只作最后候选，0 = 关闭
+-		MaxInFlight              int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+-		MaxInFlightGlobal        int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
+-		BreakerThreshold         int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+-		BreakerCooldown          string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+-		BreakerCooldownMax       string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
++		CreditFloor              int64  `json:"credit_floor"` // 保底积分（issue #364）：低于该值的账号只作最后候选，0 = 关闭
++		// ModelCreditGate 模型级积分门槛：key 为模型名，value 为最低积分。低于门槛的
++		// 账号只退出该模型的候选集，其它模型照常服务（账号级 credit_floor 做不到这点：
++		// 它一压就压全池，免费号会被一起摘掉）。用途示例：SG 模型只要积分 >= 100 的号，
++		// 低分号继续跑不受限的免费模型。0 = 关闭。
++		ModelCreditGate    map[string]int64 `json:"model_credit_gate"`
++		MaxInFlight        int              `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
++		MaxInFlightGlobal  int              `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
++		BreakerThreshold   int              `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
++		BreakerCooldown    string           `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
++		BreakerCooldownMax string           `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+ 		// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）：
+ 		// ErrClient/传输层这类「不罚号」失败连续计数，达阈临时出池。与冷却/熔断
+ 		// 并存取更长者不叠加。默认 5 次 / 10m。
+@@ -480,6 +485,21 @@ func (c *Config) normalize() error {
+ 	if c.Pool.CreditFloor < 0 {
+ 		c.Pool.CreditFloor = 0
+ 	}
++	// 模型级积分门槛：空模型名与非正门槛都是在库里无意义、在选号里等价于「关闭」
++	// 的条目，进池前先剔掉，避免每次 pick 都做一次无效 map 查找。
++	if len(c.Pool.ModelCreditGate) > 0 {
++		gate := make(map[string]int64, len(c.Pool.ModelCreditGate))
++		for model, floor := range c.Pool.ModelCreditGate {
++			if model != "" && floor > 0 {
++				gate[model] = floor
++			}
++		}
++		if len(gate) == 0 {
++			c.Pool.ModelCreditGate = nil
++		} else {
++			c.Pool.ModelCreditGate = gate
++		}
++	}
+ 	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
+ 		return fmt.Errorf("session_sticky.ttl: %w", err)
+ 	}
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index b5c0561..85b75ff 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -283,6 +283,8 @@ func main() {
+ 		GlobalEnabled: cfg.Global.Enabled,
+ 		// 运维管理端点开关（config admin.enabled，默认 false）。
+ 		AdminEnabled: cfg.Admin.Enabled,
++		// 模型级积分门槛（SG 只从余额够的号里选），与账号级 credit_floor 正交。
++		ModelCreditGate: cfg.Pool.ModelCreditGate,
+ 	})
+ 
+ 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+diff --git a/internal/pool/model_credit_gate_test.go b/internal/pool/model_credit_gate_test.go
+new file mode 100644
+index 0000000..225195c
+--- /dev/null
++++ b/internal/pool/model_credit_gate_test.go
+@@ -0,0 +1,150 @@
++package pool
++
++import (
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++)
++
++// 门槛只压指定模型：低分号退出 sg 的候选集，免费模型不受影响。
++func TestModelCreditGateScopesToOneModel(t *testing.T) {
++	p := New("")
++	defer p.Close()
++	p.Add(&auth.Auth{UID: "low"})
++	p.Add(&auth.Auth{UID: "rich"})
++	p.SetCredits("low", 95)
++	p.SetCredits("rich", 105)
++	p.SetModelCreditGate(map[string]int64{"deepseek-v4.1-flash-sg": 100})
++
++	for i := 0; i < 20; i++ {
++		got := p.Pick("deepseek-v4.1-flash-sg")
++		if got == nil {
++			t.Fatal("有 ≥ 门槛的号时 sg 不应返回 nil")
++		}
++		if got.UID != "rich" {
++			t.Fatalf("sg 选中了低分号 %s（credits=%d）", got.UID, p.creditOf(got.UID))
++		}
++	}
++	// 免费模型：低分号必须还能被选中（门槛不能溢出到其它模型）。
++	sawLow := false
++	for i := 0; i < 60; i++ {
++		got := p.Pick("deepseek-v4.1-flash")
++		if got == nil {
++			t.Fatal("免费模型不应返回 nil")
++		}
++		if got.UID == "low" {
++			sawLow = true
++			break
++		}
++	}
++	if !sawLow {
++		t.Fatal("免费模型 60 次都没选到低分号：门槛错误地作用到了别的模型")
++	}
++}
++
++// 全部号都低于门槛时必须返回 nil（交给上层 503），不能像 account 级保底那样回退。
++func TestModelCreditGateNoFallback(t *testing.T) {
++	p := New("")
++	defer p.Close()
++	p.Add(&auth.Auth{UID: "a"})
++	p.Add(&auth.Auth{UID: "b"})
++	p.SetCredits("a", 10)
++	p.SetCredits("b", 99)
++	p.SetModelCreditGate(map[string]int64{"sg": 100})
++	if got := p.Pick("sg"); got != nil {
++		t.Fatalf("全部低于门槛时应返回 nil，got %s", got.UID)
++	}
++	// 同一批号跑别的模型照常可用。
++	if got := p.Pick("free"); got == nil {
++		t.Fatal("其它模型不应受影响")
++	}
++}
++
++// credits == 0 在模型级门槛里算「不足」（与账号级保底「未知放行」故意不同）。
++func TestModelCreditGateTreatsZeroAsInsufficient(t *testing.T) {
++	p := New("")
++	defer p.Close()
++	p.Add(&auth.Auth{UID: "fresh"})
++	// 不加 SetCredits：credits 保持 0，模拟 billing 首刷之前的新号。
++	p.SetModelCreditGate(map[string]int64{"sg": 100})
++	if got := p.Pick("sg"); got != nil {
++		t.Fatalf("余额未同步的号不应接门槛模型，got %s", got.UID)
++	}
++	if got := p.Pick("free"); got == nil {
++		t.Fatal("余额未同步的号应照常服务其它模型")
++	}
++}
++
++// 全冷却兜底也要过门槛：否则正常候选被门槛清空后，低分号会从兜底原路返回。
++func TestModelCreditGateAppliesToFallback(t *testing.T) {
++	p := New("")
++	defer p.Close()
++	p.Add(&auth.Auth{UID: "low"})
++	p.Add(&auth.Auth{UID: "rich"})
++	p.SetCredits("low", 0)
++	p.SetCredits("rich", 500)
++	p.SetModelCreditGate(map[string]int64{"sg": 100})
++	p.Cooldown("rich", CoolSoft, time.Hour, "test")
++
++	if got := p.Pick("sg"); got != nil && got.UID == "low" {
++		t.Fatalf("兜底不应把低分号放回来，got %s（credits=%d）", got.UID, p.creditOf(got.UID))
++	}
++	// 免费模型走兜底仍应拿到号。
++	if got := p.Pick("free"); got == nil {
++		t.Fatal("免费模型的兜底不应受影响")
++	}
++}
++
++// 粘性绑定必须服从门槛：否则会话粘住以后，SG 流量持续压在烧空的号上。
++func TestModelCreditGateReleasesSticky(t *testing.T) {
++	p := New("")
++	defer p.Close()
++	p.Add(&auth.Auth{UID: "sticky"})
++	p.SetCredits("sticky", 50)
++	p.SetModelCreditGate(map[string]int64{"sg": 100})
++
++	if got := p.PickByUIDForModel("sticky", "sg"); got != nil {
++		t.Fatalf("低于门槛的粘性号不应命中 sg，got %s", got.UID)
++	}
++	if got := p.PickByUIDForModel("sticky", "free"); got == nil {
++		t.Fatal("低于门槛的粘性号应照常服务其它模型")
++	}
++
++	p.SetCredits("sticky", 150)
++	if got := p.PickByUIDForModel("sticky", "sg"); got == nil {
++		t.Fatal("达到门槛后粘性应恢复")
++	}
++}
++
++// 无效条目（空模型名 / 非正门槛）等价于关闭，不应产生任何过滤。
++func TestModelCreditGateDropsInvalidEntries(t *testing.T) {
++	p := New("")
++	defer p.Close()
++	p.Add(&auth.Auth{UID: "poor"})
++	p.SetCredits("poor", 1)
++	p.SetModelCreditGate(map[string]int64{"": 100, "sg": 0, "other": -5})
++	if got := p.Pick("sg"); got == nil {
++		t.Fatal("门槛为 0 时应等价于关闭")
++	}
++	if got := p.PickByUIDForModel("poor", "other"); got == nil {
++		t.Fatal("门槛为负时应等价于关闭")
++	}
++}
++
++// 与账号级保底共存：账号级压的是全池，模型级只压一个模型。
++func TestModelCreditGateCoexistsWithCreditFloor(t *testing.T) {
++	p := New("")
++	defer p.Close()
++	p.Add(&auth.Auth{UID: "mid"})
++	p.SetCredits("mid", 150)
++	p.SetCreditFloor(200) // 账号级：150 < 200，但只有它一个号 → 回退仍可用
++	p.SetModelCreditGate(map[string]int64{"sg": 400})
++
++	if got := p.Pick("sg"); got != nil {
++		t.Fatalf("模型级门槛 400 应挡住 150 分的号，got %s", got.UID)
++	}
++	if got := p.Pick("free"); got == nil {
++		t.Fatal("账号级保底在无其它候选时应回退，不应返回 nil")
++	}
++}
+diff --git a/internal/pool/pick.go b/internal/pool/pick.go
+index 35af8e9..3279aaa 100644
+--- a/internal/pool/pick.go
++++ b/internal/pool/pick.go
+@@ -61,6 +61,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+ 		if p.inFlightFull(e) {
+ 			continue // 在途占满：跳过（max=0 不限时不触发）
+ 		}
++		if !p.modelCreditOKLocked(e, reqModel) {
++			continue // 模型级积分门槛：低分号只退出这个模型的候选集，其它模型照常
++		}
+ 		cands = append(cands, e)
+ 	}
+ 	// 保底积分（issue #364）：优先从「积分不低于 floor」的账号里选。全部低于保底
+@@ -80,7 +83,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+ 	if len(cands) == 0 {
+ 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
+ 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
+-		return p.pickEarliestExpiryLocked(tried, now, realm)
++		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
+ 	}
+ 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿
+ 	// 根本进不了短名单决策，低 credits 但久置的账号会永远排不进 top5。
+@@ -243,7 +246,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+ // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
+ // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
+ // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
+-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
++// reqModel 非空时叠加模型级积分门槛：兜底是「候选集空了」的最后一道，若不在这里
++// 过滤，低分号会在正常候选被门槛清空后立刻被兜底放回来，门槛等于白设。
++func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, reqModel string) *auth.Auth {
+ 	var best *entry
+ 	for uid, e := range p.byUID {
+ 		if tried != nil && tried[uid] {
+@@ -255,6 +260,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
+ 		if e.disabled || e.manualDisabled || e.refreshRiskActive(now) {
+ 			continue // 禁用/手动停用的账号永不参与兜底
+ 		}
++		if !p.modelCreditOKLocked(e, reqModel) {
++			continue // 模型级积分门槛：低分号连兜底也不给
++		}
+ 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
+ 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+ 		}
+diff --git a/internal/pool/pool.go b/internal/pool/pool.go
+index 66d536c..02ab7d0 100644
+--- a/internal/pool/pool.go
++++ b/internal/pool/pool.go
+@@ -33,6 +33,11 @@ type Pool struct {
+ 	// 除非没有别的候选（否则阈值设高会直接 503）。`credits > 0` 才判断 —— 0 同时
+ 	// 表示「还没同步到余额」，启动时不能因此把整池排除。0 = 关闭（默认）。
+ 	creditFloor int64
++	// modelCreditGate 模型级积分门槛：key = 模型名（选号传入的裸名，如
++	// "deepseek-v4.1-flash-sg"），value = 最低积分。与 creditFloor 的区别是作用域：
++	// 门槛只把低分号踢出**指定模型**的候选集，其它模型完全不受影响 —— 这是
++	// 「某个模型烧积分狠、又不该拖累免费模型」时的唯一可用旋钮。空 map = 关闭。
++	modelCreditGate map[string]int64
+ 	// costExploreInterval costTier 条件探索窗口（issue #136 方案 a′，SetCostExploreInterval
+ 	// 注入；默认 defaultCostExploreInterval 30m）。tier 0 垄断 + tier 1 存在且距上次
+ 	// 探索 ≥ 窗口时，本次 pick 生效层切 tier 1-only（探索=搭车改道，零新增上游请求）。
+@@ -157,6 +162,50 @@ func (p *Pool) creditFloorOKLocked(e *entry) bool {
+ 	return e.credits >= p.creditFloor
+ }
+ 
++// SetModelCreditGate 设置模型级积分门槛：低于门槛的账号只退出**该模型**的候选集，
++// 其它模型照常被选中（与 SetCreditFloor 的账号级语义严格区分）。
++// 门槛为 0/负、模型名为空的条目直接丢弃（等价于关闭该条）。
++func (p *Pool) SetModelCreditGate(gate map[string]int64) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if len(gate) == 0 {
++		p.modelCreditGate = nil
++		return
++	}
++	g := make(map[string]int64, len(gate))
++	for model, floor := range gate {
++		if model != "" && floor > 0 {
++			g[model] = floor
++		}
++	}
++	if len(g) == 0 {
++		p.modelCreditGate = nil
++		return
++	}
++	p.modelCreditGate = g
++}
++
++// modelCreditOKLocked 该账号余额是否够接 reqModel。
++//
++// 与 creditFloorOKLocked 有一处**故意的语义差异**：这里 `credits == 0` 算「不足」，
++// 而不是「未知放行」。原因：模型级门槛是硬隔离（「不给低分号接这个模型」），把未
++// 同步到的 0 当作放行，等于每次重启后用 0 分号先打一轮 402，把账号再打成硬冷却；
++// 而 global 号的余额由 RunBilling 周期刷新（首刷 2 分钟、此后 30 分钟），短暂不接
++// 这个模型是可以接受的代价。账号级 creditFloor 保持「未知放行」不动。
++//
++// 模型名不匹配（含 reqModel 为空、门槛 <= 0）时恒 true，不影响其它模型。
++// 调用方必须已持有 p.mu。
++func (p *Pool) modelCreditOKLocked(e *entry, reqModel string) bool {
++	if reqModel == "" || len(p.modelCreditGate) == 0 {
++		return true
++	}
++	floor, ok := p.modelCreditGate[reqModel]
++	if !ok || floor <= 0 {
++		return true
++	}
++	return e.credits >= floor
++}
++
+ // SetCostExploreInterval 注入 costTier 条件探索窗口（main 从 config 解析后调用，
+ // issue #136）。0 = 关停（完全回到现状行为）；正值覆盖默认 30m。
+ // 注意：与 SetSoftRateMax「非正值保留默认」不同，0 在这里是**合法值**（关停开关，
+diff --git a/internal/pool/state.go b/internal/pool/state.go
+index be2656d..1baab6a 100644
+--- a/internal/pool/state.go
++++ b/internal/pool/state.go
+@@ -359,6 +359,11 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
+ 	if !p.creditFloorOKLocked(e) {
+ 		return nil
+ 	}
++	// 模型级积分门槛同理，且更硬：低分号连「被粘住」都不允许，否则 SG 流量会
++	// 沿着会话绑定持续压在已烧空的号上，正常选号里的门槛完全绕开。
++	if !p.modelCreditOKLocked(e, model) {
++		return nil
++	}
+ 	e.lastUsed = now
+ 	// 粘性路径同样推进 usedSeq/pickSeq：粘性重度使用的账号在 LRU 兜底
+ 	// （pick 按 usedSeq 选最旧）眼中不再是"最旧"，与 pick 的严格全序语义对齐
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index 3f92973..135fbdc 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -69,6 +69,10 @@ type Config struct {
+ 	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
+ 	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
+ 	AdminEnabled bool
++
++	// ModelCreditGate 模型级积分门槛：低于门槛的账号只退出该模型的候选集。
++	// 与 CreditFloor 的账号级语义互不影响（可同时使用）。
++	ModelCreditGate map[string]int64
+ }
+ 
+ // notFoundCooldown 上游 404 的固定短冷却时长。
+@@ -188,6 +192,7 @@ func NewHandler(cfg Config) *Handler {
+ 	}
+ 	if cfg.Pool != nil {
+ 		cfg.Pool.SetCreditFloor(cfg.CreditFloor)
++		cfg.Pool.SetModelCreditGate(cfg.ModelCreditGate)
+ 	}
+ 	if cfg.LargeRequestBytes == 0 {
+ 		cfg.LargeRequestBytes = 2 << 20 // 2 MiB ≈ 52 万 token：只切接近封号画像量级的超大上下文

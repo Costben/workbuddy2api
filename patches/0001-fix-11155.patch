@@ -1,8 +1,8 @@
 diff --git a/internal/server/handler.go b/internal/server/handler.go
-index b25924f..48c9352 100644
+index f8dde16..6657ab6 100644
 --- a/internal/server/handler.go
 +++ b/internal/server/handler.go
-@@ -1378,6 +1378,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+@@ -1457,6 +1457,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
  	case upstream.ErrImageInvalid:
  		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
  		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
