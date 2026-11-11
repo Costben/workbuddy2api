@@ -335,7 +335,7 @@ index 0000000..5714ef8
 +	}
 +}
 diff --git a/internal/server/handler.go b/internal/server/handler.go
-index 6657ab6..ea83d71 100644
+index 43ceee3..121f286 100644
 --- a/internal/server/handler.go
 +++ b/internal/server/handler.go
 @@ -46,6 +46,8 @@ type Config struct {
@@ -600,10 +600,10 @@ index 8fb4ea6..7763d3a 100644
  	uid8 := uid
  	if len(uid8) > 8 {
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index 9eda2e4..2c783b0 100644
+index f2a5c8a..2193900 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
-@@ -951,7 +951,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
+@@ -976,7 +976,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
  // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
  // 显式传 realm 使 effort 降级按域取桶：CN 探测信息不得作用到 global 请求（C-2）。
  // conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；
@@ -612,7 +612,7 @@ index 9eda2e4..2c783b0 100644
  func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
  	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
  	if realmKey(realm) == "global" {
-@@ -1300,7 +1300,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+@@ -1325,7 +1325,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
  	// ensureConsoleSystem 在 prepareBody 后统一套用全局脚本：首条消息非 system 时前置
  	// 兜底 system（防 console 域上游 code 11-128；#119 后 global 出站固定 /v2，
  	// 该兜底保留——上游对 /v2 是否需要 system 无实测反证，删了无回滚路径）。

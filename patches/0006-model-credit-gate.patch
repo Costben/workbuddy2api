@@ -345,7 +345,7 @@ index be2656d..1baab6a 100644
  	// 粘性路径同样推进 usedSeq/pickSeq：粘性重度使用的账号在 LRU 兜底
  	// （pick 按 usedSeq 选最旧）眼中不再是"最旧"，与 pick 的严格全序语义对齐
 diff --git a/internal/server/handler.go b/internal/server/handler.go
-index 3f92973..135fbdc 100644
+index 9c3d177..6bd49e7 100644
 --- a/internal/server/handler.go
 +++ b/internal/server/handler.go
 @@ -69,6 +69,10 @@ type Config struct {

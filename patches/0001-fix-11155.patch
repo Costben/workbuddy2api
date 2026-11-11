@@ -1,8 +1,8 @@
 diff --git a/internal/server/handler.go b/internal/server/handler.go
-index f8dde16..6657ab6 100644
+index 456354c..43ceee3 100644
 --- a/internal/server/handler.go
 +++ b/internal/server/handler.go
-@@ -1457,6 +1457,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+@@ -1465,6 +1465,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
  	case upstream.ErrImageInvalid:
  		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
  		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
@@ -77,29 +77,29 @@ index 27683c0..4c0df31 100644
  		})
  	}
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index 35b746e..9eda2e4 100644
+index bfc5a07..f2a5c8a 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
-@@ -58,6 +58,9 @@ const (
- 	// 一次误判就是永久杀号。故单列一类，由 handler 走「连续 N 次才禁用」的计数
- 	// 路径（与 12153 的 NoteSessionDead 同口径、共用计数器）。
- 	ErrAuthRejected
+@@ -62,6 +62,9 @@ const (
+ 	// 不是账号级限流：队列按账号等级全局共享，换号不会改变排队位置。账号不冷却、
+ 	// 不计数、不禁用；请求仍按 MaxRotate 轮转，最终以 429 返回让客户端等待。
+ 	ErrUpstreamQueue
 +	// ErrReasoningMissing 11155「reasoning_content_missing」（思考模式未回传上轮推理）→
 +	// 请求级错误：不罚号（不冷却/不熔断/不 NoteError），仍轮转（严格租户拒、宽松租户可过）。
 +	ErrReasoningMissing
  )
  
  func (k ErrKind) String() string {
-@@ -94,6 +97,8 @@ func (k ErrKind) String() string {
- 		return "fallback_model_missing"
- 	case ErrAuthRejected:
+@@ -100,6 +103,8 @@ func (k ErrKind) String() string {
  		return "auth_rejected"
+ 	case ErrUpstreamQueue:
+ 		return "upstream_queue"
 +	case ErrReasoningMissing:
 +		return "reasoning_content_missing"
  	case ErrClient:
  		return "client"
  	default:
-@@ -299,6 +304,24 @@ func isPromptTooLongStatus(status int) bool {
+@@ -305,6 +310,24 @@ func isPromptTooLongStatus(status int) bool {
  		status == http.StatusRequestEntityTooLarge
  }
  
@@ -124,7 +124,7 @@ index 35b746e..9eda2e4 100644
  // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
  // 与容器时区无关）。
  var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
-@@ -666,6 +689,12 @@ func Classify(status int, body string) ErrKind {
+@@ -691,6 +714,12 @@ func Classify(status int, body string) ErrKind {
  	if isPromptTooLongStatus(status) && promptTooLongRule.hit(body, lower) {
  		return ErrPromptTooLong
  	}
