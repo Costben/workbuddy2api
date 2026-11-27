@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
@@ -39,8 +40,8 @@ func TestKeepaliveSkipsAccountWithoutRefreshToken(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "no-rt", AccessToken: "at", ExpiresAt: 9999999999})
-	p.Add(&auth.Auth{UID: "has-rt", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "no-rt", AccessToken: "at", ExpiresAt: time.Now().Add(2 * time.Hour).Unix()})
+	p.Add(&auth.Auth{UID: "has-rt", AccessToken: "at", RefreshToken: "rt", ExpiresAt: time.Now().Add(2 * time.Hour).Unix()})
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	s := New(Config{Pool: p, Upstream: up})
 
@@ -68,7 +69,7 @@ func TestKeepaliveGuardRacesRefreshToken(t *testing.T) {
 	defer srv.Close()
 
 	p := pool.New("")
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: time.Now().Add(2 * time.Hour).Unix()})
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	s := New(Config{Pool: p, Upstream: up})
 

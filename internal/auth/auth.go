@@ -164,6 +164,21 @@ func (a *Auth) RefreshTokenValue() string {
 	return a.RefreshToken
 }
 
+// ExpiresAtValue 加锁读取 ExpiresAt（Unix 秒；<=0 表示到期未知）。
+//
+// 与 AccessTokenValue / DomainValue / RefreshTokenValue 同族（#125）：RefreshToken 在
+// a.mu 内写回 ExpiresAt，调度器（keepalive 的到期 / 未知到期判定）与刷新并发，锁外
+// 直读即构成数据竞争。判「到期未知」也必须走这里 —— NeedsRefresh 对 ExpiresAt<=0
+// 恒真，调用方要先区分「未知」与「已过期」才能给出不同的刷新节奏。
+func (a *Auth) ExpiresAtValue() int64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ExpiresAt
+}
+
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
 // 默认开启（与 config global.enabled 缺省 true 一致）：Realm() 正常按显式 realm/
 // domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）关闭
