@@ -20,7 +20,7 @@ func (t uaCaptureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent 未配）行为：
-// chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 路径（report/travel/balance）
+// chat/refresh 路径 UA=官方桌面端单段式；billing 路径（report/travel/balance）
 // UA=单段 `WorkBuddy/<clientVersion>`（client_name 缺省即伪造官方桌面端指纹）。
 func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 	for _, tc := range []struct {
@@ -151,19 +151,22 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 	}
 }
 
-// --- A 段：UA 对齐官方 WorkBuddy 三段式 ---
+// --- UA 对齐官方 WorkBuddy 桌面端（issue #497）---
 
 const (
-	defaultUAString      = "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
+	defaultUAString      = "WorkBuddy/5.11.3"
+	defaultCLIUAString   = "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.63.2"
 	explicitString       = "MyCustomAgent/3.1"
-	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.137.1"
-	billingUAWorkBuddy   = "WorkBuddy/5.5.4"
+	clientVerUAString    = "WorkBuddy/6.0.0"
+	clientVerCLIUAString = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.63.2"
+	billingUAWorkBuddy   = "WorkBuddy/5.11.3"
 	billingUACustomVer   = "WorkBuddy/6.0.0"
 	billingUAAgentString = "BillingAgent/1"
 )
 
 // TestUserAgentDefaultWorkBuddyShape 默认（无任何配置）聊天/刷新出站 UA =
-// 官方 WorkBuddy 三段式，旧值 `CLI/2.63.2 CodeBuddy/2.63.2` 已被对齐替换。
+// 官方桌面端单段式 `WorkBuddy/5.11.3`（issue #497 实测形态）；旧三段式与
+// 旧版本 5.5.4/2.137.1 已替换。
 func TestUserAgentDefaultWorkBuddyShape(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	c := &Client{
@@ -192,7 +195,8 @@ func (c *Client) chatLastUA() string {
 	return ""
 }
 
-// TestUserAgentExplicitOverride config user_agent 非空时以用户显式值为准（兼容旧覆盖逻辑）。
+// TestUserAgentExplicitOverride config user_agent 非空时以用户显式值为准，
+// 且优先于 ua_style=cli（显式覆盖最高优先）。
 func TestUserAgentExplicitOverride(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1", RefreshToken: "rt"}
 	c := &Client{
@@ -206,6 +210,7 @@ func TestUserAgentExplicitOverride(t *testing.T) {
 		ChatBaseCN:    "https://chat.example",
 		BillingBaseCN: "https://billing.example",
 		UserAgent:     explicitString,
+		UAStyle:       "cli", // 显式 UA 仍最高优先
 	}
 	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{}); status != 200 || err != nil {
 		t.Errorf("chat: status=%d err=%v", status, err)
@@ -220,8 +225,8 @@ func TestUserAgentExplicitOverride(t *testing.T) {
 	}
 }
 
-// TestUserAgentClientVersionOverride config client_version 生效：UA 的 WorkBuddy 段跟随
-// 且成对相同（platform 段 = applicationName 段），CLI 段保持默认。
+// TestUserAgentClientVersionOverride config client_version 生效：desktop 单段式下
+// UA 版本跟随（不含 CLI 段）。
 func TestUserAgentClientVersionOverride(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	c := &Client{
@@ -243,11 +248,47 @@ func TestUserAgentClientVersionOverride(t *testing.T) {
 	}
 }
 
+// TestUserAgentCLIStyleOverride config ua_style=cli 恢复官方 CLI 三段式：
+// `WorkBuddy/<clientVersion> WorkBuddy/<clientVersion> CLI/<cliVersion>`；
+// client_version / cli_version 两个版本段各自生效。
+func TestUserAgentCLIStyleOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		clientVersion string
+		wantUA        string
+	}{
+		{name: "defaults", wantUA: defaultCLIUAString},
+		{name: "client_version", clientVersion: "6.0.0", wantUA: clientVerCLIUAString},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &auth.Auth{AccessToken: "at", UID: "u1"}
+			c := &Client{
+				HTTP:          &http.Client{Transport: uaCaptureTransport{ua: new(string)}},
+				ChatHTTP:      &http.Client{Transport: uaCaptureTransport{ua: new(string)}},
+				ChatBaseCN:    "https://chat.example",
+				BillingBaseCN: "https://billing.example",
+				UAStyle:       "cli",
+				ClientVersion: tc.clientVersion,
+			}
+			rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{})
+			if status != 200 || err != nil {
+				t.Fatalf("chat: status=%d err=%v", status, err)
+			}
+			if got := c.chatLastUA(); got != tc.wantUA {
+				t.Errorf("UA = %q want %q", got, tc.wantUA)
+			}
+			if rc != nil {
+				rc.Close()
+			}
+		})
+	}
+}
+
 // TestBillingUA_WhenClientNameSet billing/checkin 路径：client_name 非空时用单段
 // `WorkBuddy/<clientVersion>`（不带 CLI 段，对齐官方 banner/check-in 显式头组）。
 func TestBillingUA_WhenClientNameSet(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	// 默认 client_version → WorkBuddy/5.5.4
+	// 默认 client_version → WorkBuddy/5.11.3
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 			if got := r.Header.Get("User-Agent"); got != billingUAWorkBuddy {

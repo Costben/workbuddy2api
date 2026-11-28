@@ -79,6 +79,9 @@ func (s *Scheduler) runTravel(ctx context.Context) {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
+		if a.SkipTasks {
+			continue // 账号级「只转发、不跑任务」（issue #437）
+		}
 		if a.IsGlobal() {
 			continue // D4 门控：global 无猫猫旅行体系，不发起任何上游调用
 		}

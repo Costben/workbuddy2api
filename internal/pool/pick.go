@@ -99,13 +99,14 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	}
 	// 权重与成本分层**各算一次、全程复用**（weighted 结构体定义见包级注释）：
 	// weightOf 每候选一次（预计算存入 ws.w），costTier/modelCostOf 同样每候选一次
-	// （存入 ws.tier/ws.cost1k）——sort 比较器与 pickWeighted 都只读缓存字段，
+	// （存入 ws.tier/ws.costReq）——sort 比较器与 pickWeighted 都只读缓存字段，
 	// 不再现算。比较器内现算会翻成 O(n log n) 次冗余浮点/map 查找（46 账号约
 	// 500 次比较），旧实现在此翻过车。
-	// 成本分层：reqModel 非空时，按该模型的实测扣费把候选分层，只保留最优层。
-	//   0 = 已实测免费（限免期/夜间免费的号，最强偏好）
-	//   1 = 无观测（含观测过期）
-	//   2 = 已实测收费
+	// 成本分层：reqModel 非空时，按该模型的**每次请求平均扣费**把候选分层，只保留
+	// 最优层（issue #491：per-req 才是账号真实成本；per1k 只反映请求长度）。
+	//   0 = 已累计确认免费（TotalCredit==0 且至少 2 笔；单笔 0 不算）
+	//   1 = 无观测（含观测过期）/ 单笔 0 未知
+	//   2 = 已累计收费
 	// 为什么"无观测"排在"已实测收费"之前：新号的限免状态只能靠实测发现，
 	// 若已知收费的号恒压过未知号，那台免费的号永远轮不到，也就永远学不到。
 	// 为什么用硬过滤而非仅排序：pickWeighted 会在候选内加权随机，只排序的话
@@ -115,10 +116,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if !ok {
 			return 1, 0
 		}
-		if mc.CostPer1k <= 0 {
-			return 0, 0
+		ti := mc.costTier()
+		if ti != 2 {
+			return ti, 0
 		}
-		return 2, mc.CostPer1k
+		return ti, mc.costPerReq()
 	}
 	bestTier := 2
 	hasTier1 := false
@@ -158,7 +160,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	for _, e := range cands {
 		ti, ci := costTier(e)
 		if ti == bestTier {
-			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now), tier: ti, cost1k: ci})
+			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now), tier: ti, costReq: ci})
 		}
 	}
 	// 等权重洗牌：仅当存在权重并列（epsilon 比较，防浮点微差让洗牌静默失效）且
@@ -182,10 +184,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		}
 	}
 	sort.SliceStable(ws, func(i, j int) bool {
-		// costTier 硬过滤后 ws 全员同层，但仍按 cost1k 升序排（tier 2 层内单价低者
-		// 在前；tier 0/1 层 cost1k 恒 0，本比较退化为权重比较）——读缓存字段不现算。
-		if ws[i].cost1k != ws[j].cost1k {
-			return ws[i].cost1k < ws[j].cost1k // 收费层：单价低的在前
+		// costTier 硬过滤后 ws 全员同层，但仍按 costReq 升序排（tier 2 层内
+		// per-req 低者在前；tier 0/1 层 costReq 恒 0，本比较退化为权重比较）——
+		// 读缓存字段不现算。
+		if ws[i].costReq != ws[j].costReq {
+			return ws[i].costReq < ws[j].costReq // 收费层：per-req 低的在前
 		}
 		if ws[i].w != ws[j].w {
 			return ws[i].w > ws[j].w
@@ -307,14 +310,14 @@ func (p *Pool) inFlightFull(e *entry) bool {
 var minPickGap = 100 * time.Millisecond
 
 // weighted 单个候选的选号预计算结果：权重（weightOf，每候选一次）+ 成本分层
-// （tier/cost1k，每候选一次）。sort 比较器与 pickWeighted 抽签都只读缓存字段，
+// （tier/costReq，每候选一次）。sort 比较器与 pickWeighted 抽签都只读缓存字段，
 // 任何一处现算（旧实现在比较器内重算 costTier、在 pickWeighted 内重算 weightOf）
 // 都会翻成 O(n log n) 次冗余浮点/map 查找，且引入两阶段口径分裂。
 type weighted struct {
-	e      *entry
-	w      float64
-	tier   int     // costTier 结果缓存（0 免费 / 1 无观测 / 2 收费）
-	cost1k float64 // CostPer1k 缓存（tier 2 排序用；tier 0/1 恒 0）
+	e       *entry
+	w       float64
+	tier    int     // costTier 结果缓存（0 免费 / 1 无观测 / 2 收费）
+	costReq float64 // CostPerReq 缓存（tier 2 排序用；tier 0/1 恒 0）
 }
 
 // expiringWeight 快过期积分占比的权重系数（三因子之一，issue:积分过期）。

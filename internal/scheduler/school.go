@@ -102,7 +102,38 @@ func runScriptContext(ctx context.Context, name, root string, commands [][]strin
 	}
 }
 
-// RunSchoolNow 立即执行开学季任务：school_open_day_2026.py ALL --run --yes。
+// taskAccountFiles 返回脚本类任务（开学季 / 夜猫子）应当处理的账号文件名。
+//
+// 脚本原本以「ALL」扫 auths 目录，自己看不到账号级 skip_tasks（issue #437）。
+// 这里由调度器先把「不参与任务」的账号剔除，再把剩余账号的文件名显式传给脚本：
+// 两个脚本的 load_auth 都接受 `workbuddy*.json` 文件名，因此过滤逻辑只存在于
+// 一处，也不需要改脚本本身。
+//
+// 取号池**全量**（含冷却 / 自动禁用）而不是 healthy 子集：脚本此前的覆盖范围是
+// 「auths 目录里的每个账号」，换实现不能顺手把冷却中的号排除掉 —— 那会让
+// 「不参与任务」这个开关悄悄改变其它语义。
+//
+// Pool 为空（仅测试构造）时返回 nil，调用方保持原来的 ALL 行为。
+func (s *Scheduler) taskAccountFiles() []string {
+	if s.cfg.Pool == nil {
+		return nil
+	}
+	var out []string
+	for _, st := range s.cfg.Pool.List() {
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.SkipTasks {
+			continue
+		}
+		name := strings.TrimSpace(a.FilePath)
+		if name == "" {
+			continue
+		}
+		out = append(out, filepath.Base(name))
+	}
+	return out
+}
+
+// RunSchoolNow 立即执行开学季任务：school_open_day_2026.py <accounts> --run --yes。
 // 全量跑任务点亮 + 领奖 + 自动抽空抽奖余额。活动下线（in_period=false）时脚本
 // 各段全量跳过、正常退出，不视为失败。失败只记 WARN。
 func (s *Scheduler) RunSchoolNow() { s.runSchool(context.Background()) }
@@ -117,9 +148,17 @@ func (s *Scheduler) runSchool(ctx context.Context) {
 		}
 	}
 	root := repoRoot()
-	runScriptContext(ctx, "school", root, [][]string{
-		s.accountScriptArgs(ctx, []string{pythonCmd(), "scripts/school_open_day_2026.py", "ALL", "--run", "--yes"}),
-	})
+	targets := s.taskAccountFiles()
+	if s.cfg.Pool != nil && len(targets) == 0 {
+		log.Printf("scheduled school skipped: no account to run (all skip_tasks)")
+		return
+	}
+	if len(targets) == 0 {
+		targets = []string{"ALL"} // Pool 未注入（测试构造）：保持原有全量行为
+	}
+	args := append([]string{pythonCmd(), "scripts/school_open_day_2026.py"}, targets...)
+	args = append(args, "--run", "--yes")
+	runScriptContext(ctx, "school", root, [][]string{s.accountScriptArgs(ctx, args)})
 }
 
 // RunCatNow 立即执行夜猫子任务：task_runner.py ALL --yes --only black_cat。
@@ -137,7 +176,15 @@ func (s *Scheduler) runCat(ctx context.Context) {
 		}
 	}
 	root := repoRoot()
-	runScriptContext(ctx, "cat", root, [][]string{
-		s.accountScriptArgs(ctx, []string{pythonCmd(), "scripts/task_runner.py", "ALL", "--yes", "--only", "black_cat"}),
-	})
+	targets := s.taskAccountFiles()
+	if s.cfg.Pool != nil && len(targets) == 0 {
+		log.Printf("scheduled cat skipped: no account to run (all skip_tasks)")
+		return
+	}
+	if len(targets) == 0 {
+		targets = []string{"ALL"} // Pool 未注入（测试构造）：保持原有全量行为
+	}
+	args := append([]string{pythonCmd(), "scripts/task_runner.py"}, targets...)
+	args = append(args, "--yes", "--only", "black_cat")
+	runScriptContext(ctx, "cat", root, [][]string{s.accountScriptArgs(ctx, args)})
 }

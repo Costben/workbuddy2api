@@ -41,11 +41,13 @@ func exploreLastLen(p *Pool) int {
 func TestCostExploreSpreadsTrafficAcrossFreeAccounts(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
-	p.SetCostExploreInterval(time.Nanosecond) // 窗口极小：tier 1 存在即探索
+	// 窗口极小：tier 1 存在即探索。每轮显式过窗（时间精度在 Windows 上约
+	// 0.5ms，连续 pick 的 now 可能完全相同，不能只靠 Nanosecond 判定）。
+	p.SetCostExploreInterval(time.Nanosecond)
 	p.Add(&auth.Auth{UID: "free1"})
 	p.Add(&auth.Auth{UID: "n1"})
 	p.Add(&auth.Auth{UID: "n2"})
-	p.NoteModelCost("free1", "m", 0, 1000) // tier 0 垄断层
+	noteFreeTier(p, "free1", "m") // tier 0 垄断层（两笔 0）
 
 	counts := map[string]int{}
 	for i := 0; i < 300; i++ {
@@ -53,8 +55,9 @@ func TestCostExploreSpreadsTrafficAcrossFreeAccounts(t *testing.T) {
 		if a == nil {
 			t.Fatalf("第 %d 次 pick 返回 nil", i)
 		}
-		// 每次成功都写观测（credit=0 免费）：探索→NoteModelCost(0)→毕业自然发生。
-		p.NoteModelCost(a.UID, "m", 0, 1000)
+		// 每次成功都写观测（credit=0 免费）：每次选中写一笔，累计两笔即毕业。
+		p.NoteModelCost(a.UID, "m", 0, modelCostMinTokens)
+		passExploreWindow(p, "", "m")
 		counts[a.UID]++
 	}
 	for _, uid := range []string{"free1", "n1", "n2"} {
@@ -82,7 +85,7 @@ func TestCostExploreProbesAndGraduates(t *testing.T) {
 	p.SetCostExploreInterval(time.Hour) // 只探一次（后续 elapsed < 1h）
 	p.Add(&auth.Auth{UID: "free"})
 	p.Add(&auth.Auth{UID: "unknown"})
-	p.NoteModelCost("free", "m", 0, 1000) // tier 0
+	noteFreeTier(p, "free", "m") // tier 0
 
 	// 首个 pick：零值 timer = 从未探索 → 首次即探，tier 1-only 层只有 unknown。
 	if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "unknown" {
@@ -92,8 +95,10 @@ func TestCostExploreProbesAndGraduates(t *testing.T) {
 		t.Fatalf("探索事件数=%d want 1", got)
 	}
 
-	// 免费毕业：首观测写入即改变层归属（无延迟），后续 pick 两号均可选。
-	p.NoteModelCost("unknown", "m", 0, 1000)
+	// 免费毕业：需两笔 credit=0（新语义：单笔 0 仍是未知层），第二笔写入即
+	// 改变层归属（无延迟），后续 pick 两号均可选。
+	p.NoteModelCost("unknown", "m", 0, modelCostMinTokens)
+	p.NoteModelCost("unknown", "m", 0, modelCostMinTokens)
 	counts := map[string]int{}
 	for i := 0; i < 50; i++ {
 		a := p.PickExcludingForRealm(nil, "m", "")
@@ -118,12 +123,12 @@ func TestCostExploreGraduatesToPaid(t *testing.T) {
 	p.SetCostExploreInterval(time.Hour)
 	p.Add(&auth.Auth{UID: "free"})
 	p.Add(&auth.Auth{UID: "paid-later"})
-	p.NoteModelCost("free", "m", 0, 1000)
+	noteFreeTier(p, "free", "m")
 
 	if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "paid-later" {
 		t.Fatalf("首个 pick=%v want paid-later（探索改道）", a)
 	}
-	p.NoteModelCost("paid-later", "m", 2.9, 1000) // 收费毕业 → tier 2
+	p.NoteModelCost("paid-later", "m", 2.9, modelCostMinTokens) // 收费毕业 → tier 2
 
 	for i := 0; i < 50; i++ {
 		if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "free" {
@@ -143,7 +148,7 @@ func TestCostExploreBoundedPerWindow(t *testing.T) {
 	p.SetCostExploreInterval(time.Hour)
 	p.Add(&auth.Auth{UID: "free"})
 	p.Add(&auth.Auth{UID: "unknown"})
-	p.NoteModelCost("free", "m", 0, 1000)
+	noteFreeTier(p, "free", "m")
 
 	// 首次 pick 探索（timer 写入）→ 同窗口内后续 50 次全部回到 tier 0。
 	if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "unknown" {
@@ -178,7 +183,7 @@ func TestCostExploreOff(t *testing.T) {
 	p.SetCostExploreInterval(0) // 0 = 关停
 	p.Add(&auth.Auth{UID: "free"})
 	p.Add(&auth.Auth{UID: "unknown"})
-	p.NoteModelCost("free", "m", 0, 1000)
+	noteFreeTier(p, "free", "m")
 
 	for i := 0; i < 50; i++ {
 		if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "free" {
@@ -214,8 +219,8 @@ func TestCostExploreRequiresTier0AndTier1(t *testing.T) {
 	p2.SetCostExploreInterval(time.Hour)
 	p2.Add(&auth.Auth{UID: "u1"})
 	p2.Add(&auth.Auth{UID: "u2"})
-	p2.NoteModelCost("u1", "m", 0, 1000)
-	p2.NoteModelCost("u2", "m", 0, 1000)
+	noteFreeTier(p2, "u1", "m")
+	noteFreeTier(p2, "u2", "m")
 	for i := 0; i < 10; i++ {
 		p2.PickExcludingForRealm(nil, "m", "")
 	}
@@ -235,7 +240,7 @@ func TestCostExploreRequiresModel(t *testing.T) {
 	p.SetCostExploreInterval(time.Hour)
 	p.Add(&auth.Auth{UID: "free"})
 	p.Add(&auth.Auth{UID: "unknown"})
-	p.NoteModelCost("free", "m", 0, 1000)
+	noteFreeTier(p, "free", "m")
 
 	for i := 0; i < 10; i++ {
 		if a := p.Pick(""); a == nil {
@@ -259,7 +264,7 @@ func TestCostExploreSkipsWhenTier1Unavailable(t *testing.T) {
 	p.SetCostExploreInterval(time.Hour)
 	p.Add(&auth.Auth{UID: "free"})
 	p.Add(&auth.Auth{UID: "unknown"})
-	p.NoteModelCost("free", "m", 0, 1000)
+	noteFreeTier(p, "free", "m")
 	p.Cooldown("unknown", CoolSoft, time.Minute, "429 rate limit")
 	for i := 0; i < 5; i++ {
 		if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "free" {
@@ -276,7 +281,7 @@ func TestCostExploreSkipsWhenTier1Unavailable(t *testing.T) {
 	p2.SetMaxInFlight(1)
 	p2.Add(&auth.Auth{UID: "free"})
 	p2.Add(&auth.Auth{UID: "unknown"})
-	p2.NoteModelCost("free", "m", 0, 1000)
+	noteFreeTier(p2, "free", "m")
 	if !p2.Acquire("unknown") {
 		t.Fatal("Acquire(unknown) 失败（上限 1 应可占 1 个名额）")
 	}
@@ -298,7 +303,7 @@ func TestCostExploreFailureNoStorm(t *testing.T) {
 	p.SetCostExploreInterval(time.Hour)
 	p.Add(&auth.Auth{UID: "free"})
 	p.Add(&auth.Auth{UID: "unknown"})
-	p.NoteModelCost("free", "m", 0, 1000)
+	noteFreeTier(p, "free", "m")
 
 	if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "unknown" {
 		t.Fatalf("首个 pick=%v want unknown（探索改道）", a)
@@ -324,7 +329,7 @@ func TestCostExploreConcurrentSingleFire(t *testing.T) {
 	p.SetCostExploreInterval(time.Hour)
 	p.Add(&auth.Auth{UID: "free"})
 	p.Add(&auth.Auth{UID: "unknown"})
-	p.NoteModelCost("free", "m", 0, 1000)
+	noteFreeTier(p, "free", "m")
 
 	const n = 20
 	var wg sync.WaitGroup
@@ -352,7 +357,7 @@ func TestCostExploreNotPersisted(t *testing.T) {
 	p.SetCostExploreInterval(time.Hour)
 	p.Add(&auth.Auth{UID: "free"})
 	p.Add(&auth.Auth{UID: "unknown"})
-	p.NoteModelCost("free", "m", 0, 1000)
+	noteFreeTier(p, "free", "m")
 
 	if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "unknown" {
 		t.Fatalf("首个 pick=%v want unknown（探索改道）", a)
@@ -379,7 +384,7 @@ func TestCostExploreStatusExposed(t *testing.T) {
 	p.SetCostExploreInterval(time.Hour)
 	p.Add(&auth.Auth{UID: "free"})
 	p.Add(&auth.Auth{UID: "unknown"})
-	p.NoteModelCost("free", "m", 0, 1000)
+	noteFreeTier(p, "free", "m")
 
 	events, last := p.CostExploreStatus()
 	if events != 0 || len(last) != 0 {
@@ -414,8 +419,8 @@ func TestCostExploreKeyByRealmAndModel(t *testing.T) {
 	p.Add(&auth.Auth{UID: "cn2", Domain: ""})
 	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
 	p.Add(&auth.Auth{UID: "g2", Domain: "workbuddy.ai"})
-	p.NoteModelCost("cn1", "m", 0, 1000)
-	p.NoteModelCost("g1", "m", 0, 1000)
+	noteFreeTier(p, "cn1", "m")
+	noteFreeTier(p, "g1", "m")
 
 	// cn 域探索：只看 cn 候选（cn1 tier0 + cn2 tier1）。
 	if a := p.PickExcludingForRealm(nil, "m", "cn"); a == nil || a.UID != "cn2" {

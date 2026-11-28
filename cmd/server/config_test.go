@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"workbuddy2api/internal/prompt"
 )
 
 func TestDefault(t *testing.T) {
@@ -583,7 +585,7 @@ func TestPromptFileMissing(t *testing.T) {
 	}
 }
 
-// TestPromptFileOverride 自定义 file 覆盖内置默认。
+// TestPromptFileOverride 自定义 file 覆盖兜底文本。
 func TestPromptFileOverride(t *testing.T) {
 	dir := t.TempDir()
 	pf := filepath.Join(dir, "my.md")
@@ -599,6 +601,25 @@ func TestPromptFileOverride(t *testing.T) {
 	}
 	if c.PromptText != want {
 		t.Errorf("PromptText=%q want %q", c.PromptText, want)
+	}
+}
+
+// TestPromptEmptyFileFallsBackToDegraded issue #498：custom/append 未配 file 时
+// 不再加载随二进制分发的人设，而是极短的中性兜底（并打 WARN，不静默）。
+func TestPromptEmptyFileFallsBackToDegraded(t *testing.T) {
+	for _, mode := range []string{"custom", "append"} {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		if err := os.WriteFile(fp, []byte(`{"prompt":{"mode":"`+mode+`"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatalf("mode=%s: %v", mode, err)
+		}
+		if c.PromptText != prompt.Degraded {
+			t.Errorf("mode=%s: PromptText len=%d want Degraded", mode, len(c.PromptText))
+		}
 	}
 }
 
@@ -660,6 +681,42 @@ func TestUpstreamVersionConfig(t *testing.T) {
 	}
 }
 
+// TestUpstreamUAStyleConfig upstream.ua_style：缺省归一为 desktop（官方桌面端
+// 单段式），显式 cli 保留三段式；env WB2A_UA_STYLE 同样生效；非法值 fail-fast。
+func TestUpstreamUAStyleConfig(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"ua_style":"cli"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.UAStyle != "cli" {
+		t.Errorf("ua_style=%q want cli", c.Upstream.UAStyle)
+	}
+	// 缺省（未配置）= desktop。
+	if c2, err := Load(""); err != nil || c2.Upstream.UAStyle != "desktop" {
+		t.Errorf("default ua_style=%q want desktop (err=%v)", c2.Upstream.UAStyle, err)
+	}
+	// env 覆盖（大小写/空白归一）。
+	t.Setenv("WB2A_UA_STYLE", "  CLI  ")
+	c3, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.Upstream.UAStyle != "cli" {
+		t.Errorf("env ua_style=%q want cli", c3.Upstream.UAStyle)
+	}
+	// 非法值拒绝启动（避免拼错后静默发成桌面 UA）。
+	// 先清空上一条 env 覆盖，否则它仍会盖过文件里的非法值。
+	t.Setenv("WB2A_UA_STYLE", "")
+	fp2 := filepath.Join(dir, "bad.json")
+	os.WriteFile(fp2, []byte(`{"upstream":{"ua_style":"browser"}}`), 0o600)
+	if _, err := Load(fp2); err == nil {
+		t.Error("invalid ua_style accepted, want error")
+	}
+}
+
 // TestUpstreamUserAgentConfig 配置 upstream.user_agent 与 env WB2A_USER_AGENT 均生效，
 // 缺省空串保持现状（headers 层回落到 clientUA）。
 func TestUpstreamUserAgentConfig(t *testing.T) {
@@ -691,8 +748,8 @@ func TestUpstreamUserAgentConfig(t *testing.T) {
 
 // ---- prompt.mode=append（issue #129 三模式） ----
 
-// TestPromptAppendModeAccepted B1：append 新值合法，PromptText 非空（内置默认，
-// 与 custom 同加载路径）。
+// TestPromptAppendModeAccepted B1：append 新值合法，PromptText 非空（空 file 走
+// 中性兜底，与 custom 同加载路径）。
 func TestPromptAppendModeAccepted(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")

@@ -4,5 +4,5 @@
 维护者留存并继续维护。许可为 MIT（见 LICENSE，版权归原作者）——再分发请保留
 LICENSE 与版权声明。
 
-打包说明：keepalive near-expiry with max refresh age (0058)
-打包时间：2026-11-26 21:52:48
+打包说明：prompt fallback: drop embedded persona, neutral Degraded (0064)
+打包时间：2026-11-27 18:52:03

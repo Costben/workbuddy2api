@@ -80,7 +80,7 @@ func TestV3MergeE2EGlobal(t *testing.T) {
 }
 
 // TestV3MergeE2EEndpointsReachable 独立 curl 等价验证：两端点经 CommonHeaders
-// （三段式 CLI UA）+ Bearer 均 200（任务书验收 4：实测确认仍 200）。
+// （当前默认 UA 形态）+ Bearer 均 200（任务书验收 4：实测确认仍 200）。
 func TestV3MergeE2EEndpointsReachable(t *testing.T) {
 	a := loadGlobalAcct(t)
 	c := &Client{

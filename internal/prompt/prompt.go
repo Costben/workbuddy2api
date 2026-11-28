@@ -1,39 +1,42 @@
-// Package prompt 提供网关自有系统提示词：内置默认 + 文件覆盖 + 降级中性提示词。
+// Package prompt 提供网关自有系统提示词：文件加载 + 中性兜底提示词。
 //
 // 背景：客户端（Claude Code/Codex 等 CLI）在 system prompt 注入固定模板句，
 // 上游内容审核按逐字精确匹配误杀合法流量（issue #36/PR39 的 11128）。
 // 方案：网关在出站前用自有系统提示词替换客户端 system/developer 消息，
 // 从源头消灭 system 来源的指纹误报（用户/assistant 消息里的指纹串仍由
 // internal/upstream/sanitize.go 清洗，两层叠加、互不替代）。
+//
+// 不再内置任何人设文本（issue #498）：custom/append 模式的提示词一律由使用者
+// 通过 prompt.file 提供；file 留空时只回落到中性兜底 Degraded，且该常量极短，
+// 不会给每条请求打上新的、比客户端原文更独特的指纹。
 package prompt
 
 import (
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 )
 
-//go:embed defaultprompt.md
-var defaultPrompt string
-
 // Degraded 降级提示词：误报处理用，刻意极简中性。
 //
 // 触发场景：passthrough 模式下请求被上游内容策略拦截（HTTP 400 + 审核文案），
 // 判定为指纹误报后换最小中性提示词重试一次。非对抗框架——只用于绕开
 // system 来源的误报，不改变用户指令的合法性语义。
+//
+// custom/append 模式未配置 prompt.file 时也回落到这段文本（issue #498：
+// 以前回落到内置的 15 KB 人设，既不中性、又随二进制分发）。
 const Degraded = "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise."
 
 // Load 按 mode 与 file 加载系统提示词文本。
 //   - file 非空 → 读文件（不存在/读失败返回 error，调用方 fail fast）；
-//   - file 空 → 返回内置 defaultPrompt。
+//   - file 空 → 返回中性兜底 Degraded（不再有内置人设文本，issue #498）。
 //
 // mode 在此仅做透传记录（实际 custom/passthrough 路由由调用方决定），
 // Load 只负责"拿到一段提示词文本"，不关心路由语义。
 func Load(mode, file string) (string, error) {
-	if file == "" {
-		return defaultPrompt, nil
+	if strings.TrimSpace(file) == "" {
+		return Degraded, nil
 	}
 	raw, err := os.ReadFile(file)
 	if err != nil {

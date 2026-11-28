@@ -52,10 +52,11 @@ type Status struct {
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
-	//「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
-	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
-	// samples）；无观测/全部过期 → nil（tier 1 未知层）。过期即消失（零回归，
-	// 只读遍历零风险）。tier 不单独落字段（可由 per1k≤0 推出，零冗余）。
+	//「为什么总选它」——tier 0（两笔以上 0 免费）垄断 / tier 2 按 per-req 排序
+	// 一眼可见；cost_per_1k 仅作诊断。
+	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_req + 诊断 cost_per_1k +
+	// last_seen + samples）；无观测/全部过期 → nil（tier 1 未知层）。过期即消失
+	// （零回归，只读遍历零风险）。tier 不单独落字段（由累计量推出，零冗余）。
 	ModelCosts     []ModelCostStatus `json:"model_costs,omitempty"`
 	Disabled       bool              `json:"disabled"`
 	DisabledReason string            `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
@@ -94,15 +95,19 @@ type RateLimitedModel struct {
 }
 
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
-// tier 不单独落字段：cost_per_1k ≤ 0 即 tier 0（免费），> 0 即 tier 2（收费），
-// 无观测即 tier 1——由调用方/面板按值推出，避免双表示漂移。
+// tier 不单独落字段：tier 由累计量推出（见 modelCostEntry.costTier），
+// 无观测即 tier 1——避免双表示漂移。
 type ModelCostStatus struct {
 	Model string `json:"model"`
-	// CostPer1k 实测每千 token 单价（EMA 平滑值）。≤0 = 实测免费（tier 0）。
+	// CostPerReq 实测每次请求的平均扣费（TotalCredit/TotalRequests），选号分层的
+	// 权威口径。credit 主要是每次请求的固定底价，per-req 才反映账号真实成本。
+	CostPerReq float64 `json:"cost_per_req"`
+	// CostPer1k 每千 token 单价（TotalCredit/TotalTokens*1000）——**诊断值**，
+	// 仅用于解释「为什么这个号 per-req 是这个数」，不再参与选号排序。
 	CostPer1k float64 `json:"cost_per_1k"`
 	// LastSeen 最近一次观测时刻（过期即从台账消失，同 modelCostTTL 口径）。
 	LastSeen time.Time `json:"last_seen"`
-	// Samples 累计观测次数（EMA 收敛度参考）。
+	// Samples 累计观测次数（诊断）。
 	Samples int `json:"samples,omitempty"`
 }
 
@@ -409,7 +414,7 @@ type stateAccount struct {
 	// ModelCosts 实测扣费账本（model → 单价观测，见 entry.modelCost）。持久化
 	// （P1-anti-monopoly）：重启后成本知识保留，限免/夜间免费的跨重启窗口不再
 	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
-	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/零 LastSeen 的结构破损条目）。
+	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/累计量、零 LastSeen 的结构破损条目）。
 	// 与运行态 modelCostEntry 字段一一对应（单一表示，内存与落盘同构不搞两套）。
 	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
 }
@@ -423,12 +428,16 @@ type stateModelCooldown struct {
 }
 
 // stateModelCost 单个 (账号, 模型) 的成本观测持久化记录，与运行态 modelCostEntry
-// 字段一一对应（CostPer1k/LastSeen/Samples），落盘/恢复往返无损（EMA 值随
-// JSON 浮点原样保留，往返不引入漂移）。
+// 字段一一对应，落盘/恢复往返无损（累计量/诊断值随 JSON 浮点原样保留）。
+// TotalCredit/TotalRequests/TotalTokens 是 issue #491 新增的累计量；老 state.json
+// 没有它们（Requests=0），恢复侧按迁移语义沿用 CostPer1k，见 modelCostEntry.costPerReq。
 type stateModelCost struct {
-	CostPer1k float64   `json:"cost_per_1k"`
-	LastSeen  time.Time `json:"last_seen"`
-	Samples   int       `json:"samples,omitempty"`
+	CostPer1k     float64   `json:"cost_per_1k"`
+	LastSeen      time.Time `json:"last_seen"`
+	Samples       int       `json:"samples,omitempty"`
+	TotalCredit   float64   `json:"total_credit,omitempty"`
+	TotalRequests int64     `json:"total_requests,omitempty"`
+	TotalTokens   int64     `json:"total_tokens,omitempty"`
 }
 
 // modelCostTTL 成本观测的有效期。取 6 小时：既覆盖"夜间免费"这类时段性优惠的
@@ -436,11 +445,82 @@ type stateModelCost struct {
 // 白天会把已开始收费的号继续当成免费。
 const modelCostTTL = 6 * time.Hour
 
+// modelCostMinTokens 成本观测的最小样本量（issue #491）。tokens 低于该值的请求
+// 不更新账本：一次 max_tokens=5 的短探测扣费几乎全部是固定底价，按 per-token
+// 折算会得到极端单价；EMA 再把它平滑进账本，一次探测能污染很久。2k 是
+// 「固定底价 vs token 成本」开始可分的最小量级（短于它的观测只扣余额，不记账）。
+const modelCostMinTokens = 2000
+
 // modelCostEntry 运行时成本账本（持久化镜像 stateModelCost 与其字段一一对应）。
+//
+// issue #491：选号改用「每次请求平均扣费」TotalCredit/TotalRequests——credit 主要
+// 是每次请求的固定底价，几乎不随 token 增长；旧的 per1k 实际度量的是「这个号平均
+// 接到多长的请求」，跨账号能差 1300 倍。累计量只增不减，不做 EMA（一次短探测
+// 不会再长期污染账本）。
 type modelCostEntry struct {
-	CostPer1k float64
+	// CostPer1k 每千 token 单价诊断值（由累计量现算；老数据迁移时是旧 EMA 值）。
+	// 不参与选号排序。
+	CostPer1k float64 `json:"cost_per_1k,omitempty"`
 	LastSeen  time.Time
 	Samples   int
+	// TotalCredit / TotalRequests / TotalTokens 累计扣费、请求数、token 数。
+	TotalCredit   float64 `json:"total_credit,omitempty"`
+	TotalRequests int64   `json:"total_requests,omitempty"`
+	TotalTokens   int64   `json:"total_tokens,omitempty"`
+}
+
+// costPerReq 每次请求的平均扣费（选号分层的权威口径）。
+// TotalRequests==0 是老 state.json 的迁移形态：沿用旧 CostPer1k，绝不置 0——
+// 否则升级后全池瞬间按 0 成本挤进 tier 0。
+func (mc modelCostEntry) costPerReq() float64 {
+	if mc.TotalRequests > 0 {
+		return mc.TotalCredit / float64(mc.TotalRequests)
+	}
+	if mc.CostPer1k > 0 {
+		return mc.CostPer1k
+	}
+	return 0
+}
+
+// per1k 由累计量现算每千 token 单价（诊断值；不参与选号）。
+// TotalTokens==0 时返回持久化的旧值（迁移形态）。
+func (mc modelCostEntry) per1k() float64 {
+	if mc.TotalTokens > 0 {
+		return mc.TotalCredit / float64(mc.TotalTokens) * 1000
+	}
+	return mc.CostPer1k
+}
+
+// costTier 成本分层：
+//   - 0 = 已累计观测免费（TotalCredit==0 且至少 2 笔请求）
+//   - 1 = 无观测 / 单笔 0 未知（单笔 credit=0 可能只是短请求的固定底价豁免）
+//   - 2 = 已累计观测收费
+//
+// Requests==0 是老 state.json 迁移形态：保留旧的免费/收费结论（CostPer1k<=0 且
+// Samples>=2 视为旧免费观测；单笔旧 0 观测按未知处理，与新的「单笔 0 不判免费」一致）。
+func (mc modelCostEntry) costTier() int {
+	if mc.TotalRequests == 0 {
+		if mc.CostPer1k <= 0 {
+			if mc.Samples >= 2 {
+				return 0
+			}
+			return 1
+		}
+		return 2
+	}
+	if mc.TotalCredit == 0 {
+		if mc.TotalRequests >= 2 {
+			return 0
+		}
+		return 1
+	}
+	return 2
+}
+
+// knownFree 报告该条目在写入口是否已是「已确认免费」状态（用于限免结束日志）。
+// 老数据迁移形态沿用旧结论，判定口径与 costTier 一致。
+func (mc modelCostEntry) knownFree() bool {
+	return mc.costTier() == 0
 }
 
 // modelCooldown 单个 (账号, 模型) 的模型级独立冷却记录。**已持久化**（stateAccount.ModelCooldowns

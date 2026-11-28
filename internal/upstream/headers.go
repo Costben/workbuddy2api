@@ -15,15 +15,21 @@ import (
 const (
 	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
 	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本
-	// （/tmp/wb-ua-fp/step1-fingerprint.md §1.2：WORKBUDDY_CLIENT_VERSION = 桌面端
-	// package.json version，5.5.4 分发包即 5.5.4）。config upstream.client_version
-	// 可覆盖（空 = 内置默认）。
-	defaultClientVersion = "5.5.4"
+	// （issue #497：桌面端 5.11.3 实测请求头为单段 `WorkBuddy/5.11.3`）。
+	// config upstream.client_version 可覆盖（空 = 内置默认）。
+	defaultClientVersion = "5.11.3"
 	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI
-	// （step1 §1.4：cli/package.json publishConfig.customPackage version = 2.137.1
-	// → resolveBundledCliUserAgent() 返回 CLI/2.137.1）。config upstream.cli_version
+	// （issue #497：官方 CLI 实测为 `CLI/2.63.2 CodeBuddy/2.63.2`）。
+	// 仅在 upstream.ua_style=cli 的三段式形态中使用；config upstream.cli_version
 	// 可覆盖（空 = 内置默认）。
-	defaultCliVersion = "2.137.1"
+	defaultCliVersion = "2.63.2"
+
+	// uaStyleDesktop 官方桌面端 UA 形态（默认）：单段 `WorkBuddy/<ver>`（global
+	// 为平台段 `WorkBuddy AI/<ver>`），与桌面端 5.11.3 的实际请求头一致。
+	uaStyleDesktop = "desktop"
+	// uaStyleCLI 旧版 CLI 三段式 UA 形态：`WorkBuddy/<ver> <platform>/<ver> CLI/<cliVer>`。
+	// 仅通过 config upstream.ua_style=cli 显式启用。
+	uaStyleCLI = "cli"
 
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
@@ -55,27 +61,48 @@ func (c *Client) cliVersion() string {
 	return defaultCliVersion
 }
 
-// defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方桌面端 RestOperations 层形状）：
-// `WorkBuddy/<clientVersion> <platform>/<clientVersion> CLI/<cliVersion>`
-// （step1 §1.3：applicationName/version + platform/version + CLI/<cliVersion>）。
-// 平台段（第二段）品牌按 realm 切换——CN 用 applicationName 同值 `WorkBuddy`，
-// global 用官方国际版 productName `WorkBuddy AI`（intl 项目逆向证据
-// ANALYSIS-global-chat-solutions.md：`WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2`）。
-// global 账号送错平台段（`WorkBuddy` 非 `WorkBuddy AI`）可能触发上游 403 code 11140
-// "request illegal" 风控。官方无任何 UA 随机化（step1 §4），故默认确定性。
+// defaultWorkBuddyUAFor 组装默认客户端出站 UA。
+//
+// 默认（ua_style 空/desktop）对齐官方 WorkBuddy 桌面端的单段式：
+//
+//	CN:     `WorkBuddy/<clientVersion>`
+//	global: `WorkBuddy AI/<clientVersion>`（保留平台段品牌语义）
+//
+// ua_style=cli 时保留旧版三段式（官方 CLI 形态）：
+//
+//	`WorkBuddy/<clientVersion> <platform>/<clientVersion> CLI/<cliVersion>`
+//
+// global 账号送错平台段（`WorkBuddy` 非 `WorkBuddy AI`）可能触发上游 403 code
+// 11140 "request illegal" 风控。官方无任何 UA 随机化，故默认确定性。
 // realm 判定委托 auth.Realm()（含全局开关逃生门）。
 func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
 	platform := "WorkBuddy"
 	if a != nil && a.IsGlobal() {
 		platform = "WorkBuddy AI"
 	}
-	return "WorkBuddy/" + c.clientVersion() + " " + platform + "/" + c.clientVersion() + " CLI/" + c.cliVersion()
+	if c.uaStyle() == uaStyleCLI {
+		return "WorkBuddy/" + c.clientVersion() + " " + platform + "/" + c.clientVersion() + " CLI/" + c.cliVersion()
+	}
+	return platform + "/" + c.clientVersion()
+}
+
+// uaStyle 生效的 UA 形态：空/未知值回落 desktop（安全默认），仅显式 cli 走三段式。
+// 配置层 normalize 已把合法值归一为 desktop/cli；这里再做一次容错，保证直接构造
+// Client（测试、库调用）时行为确定。
+func (c *Client) uaStyle() string {
+	if c == nil {
+		return uaStyleDesktop
+	}
+	if strings.EqualFold(strings.TrimSpace(c.UAStyle), uaStyleCLI) {
+		return uaStyleCLI
+	}
+	return uaStyleDesktop
 }
 
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
-// 优先级：Client.UserAgent（config user_agent）显式覆盖 > 按账号 realm 的默认 WorkBuddy 三段式。
-// 显式覆盖兼容既有覆盖逻辑：用户配了即以用户值为准（自定义品牌/版本），
-// 未配则走官方桌面端默认形态（global 换 `WorkBuddy AI` 平台段）。
+// 优先级：Client.UserAgent（config user_agent）显式覆盖 > ua_style 形态
+// （desktop 单段式 / cli 三段式）。未配 ua_style 时走官方桌面端默认单段式
+// （global 为 `WorkBuddy AI/<ver>`）。
 func (c *Client) userAgent(a *auth.Auth) string {
 	if c != nil && c.UserAgent != "" {
 		return c.UserAgent
@@ -89,6 +116,8 @@ func (c *Client) userAgent(a *auth.Auth) string {
 // 为 `WorkBuddy/<pkgVer>`，RestOperations 层的 CLI 扩展段被业务层固化覆盖掉）。
 // 默认（client_name 空）即生效（伪造官方桌面端指纹）；
 // 显式 client_name="SaaS" 则不设 UA（还原旧行为，Go 默认 UA）。
+// 该路径固定单段式，不受 upstream.ua_style 影响（官方桌面端与 CLI 在
+// billing/checkin 白名单接口都覆写成单段）。
 func (c *Client) billingUA() string {
 	if c == nil || c.attributionClientName() == "SaaS" {
 		return ""

@@ -82,8 +82,9 @@ func (c *Client) agentToolSearchBase(a *auth.Auth) string {
 // 15001 等由调用方按 IsQuotaExhausted 处置）。
 //
 // 头体系与官方 CLI WebSearchTool.performWebSearch 对齐（04 文档 §2 头表）：
-//   - CommonHeaders：UA 三段式 / Origin/Referer / X-Requested-With /
-//     X-CodeBuddy-Request / Accept-Language / X-Machine-ID / X-Session-ID
+//   - CommonHeaders：UA（ua_style 默认桌面单段式）/ Origin/Referer /
+//     X-Requested-With / X-CodeBuddy-Request / Accept-Language /
+//     X-Machine-ID / X-Session-ID
 //   - injectAttribution：X-Agent-Purpose / X-Product / X-IDE-*（用量归因）
 //   - Authorization: Bearer accessToken（搜索是账号业务面，非匿名接口）
 //   - X-User-Id / 企业与域头：与 ChatHeaders 同款（账号维度必发）

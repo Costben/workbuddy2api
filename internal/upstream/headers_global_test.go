@@ -8,10 +8,9 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
-// globalUAString global realm 默认出站 UA：第二段 platform 品牌为官方国际版
-// `WorkBuddy AI`（intl 项目逆向证据：WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2），
-// 版本段保持现有 clientVersion/cliVersion（本仓库 5.5.4/2.137.1），只切品牌段。
-const globalUAString = "WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1"
+// globalUAString global realm 默认出站 UA：官方桌面端单段式，品牌为国际版
+// `WorkBuddy AI`（issue #497：保留平台段语义，去掉重复 WorkBuddy 段与 CLI 段）。
+const globalUAString = "WorkBuddy AI/5.11.3"
 
 // TestChatHeadersGlobalRealm global 账号的 chat 请求头对齐 intl 三件套：
 //  1. UA 含 `WorkBuddy AI/<v>` 平台段（非 CN 的 `WorkBuddy/<v>`）；
@@ -127,7 +126,8 @@ func TestChatHeadersCNNoEnterpriseZeroRegression(t *testing.T) {
 }
 
 // TestDefaultWorkBuddyUAForGlobal UA 品牌段按 realm 切换的单元级断言：
-// global → 第二段 `WorkBuddy AI`；CN → 第二段 `WorkBuddy`。
+// desktop 默认下 global → `WorkBuddy AI/<ver>`，CN → `WorkBuddy/<ver>`；
+// ua_style=cli 时恢复三段式且仍按 realm 切平台段。
 func TestDefaultWorkBuddyUAForGlobal(t *testing.T) {
 	c := &Client{}
 	if got := c.defaultWorkBuddyUAFor(&auth.Auth{}); got != defaultUAString {
@@ -138,8 +138,13 @@ func TestDefaultWorkBuddyUAForGlobal(t *testing.T) {
 	}
 	// version 覆盖仍生效：global 平台段跟随 clientVersion。
 	c2 := &Client{ClientVersion: "6.0.0"}
-	if got := c2.defaultWorkBuddyUAFor(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "WorkBuddy/6.0.0 WorkBuddy AI/6.0.0 CLI/2.137.1" {
+	if got := c2.defaultWorkBuddyUAFor(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "WorkBuddy AI/6.0.0" {
 		t.Errorf("defaultWorkBuddyUAFor(global, v6) = %q", got)
+	}
+	// ua_style=cli：global 三段式（平台段 WorkBuddy AI），CLI 段用 cliVersion。
+	c3 := &Client{UAStyle: "cli", ClientVersion: "6.0.0", CliVersion: "9.9.9"}
+	if got := c3.defaultWorkBuddyUAFor(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "WorkBuddy/6.0.0 WorkBuddy AI/6.0.0 CLI/9.9.9" {
+		t.Errorf("defaultWorkBuddyUAFor(global, cli) = %q", got)
 	}
 }
 

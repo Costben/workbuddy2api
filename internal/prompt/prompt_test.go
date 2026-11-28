@@ -190,16 +190,23 @@ func TestRewriteEmptyPromptReturnedAsIs(t *testing.T) {
 	}
 }
 
-func TestLoadDefaultWhenFileEmpty(t *testing.T) {
-	got, err := Load("custom", "")
-	if err != nil {
-		t.Fatal(err)
+// TestLoadNeutralFallbackWhenFileEmpty 空 file 只回落中性兜底（issue #498）：
+// 以前回落到随二进制分发的 15 KB 人设，既是隐私问题、又给每条请求打上更强指纹。
+func TestLoadNeutralFallbackWhenFileEmpty(t *testing.T) {
+	for _, mode := range []string{"custom", "append"} {
+		for _, file := range []string{"", "   ", "\t\n"} {
+			got, err := Load(mode, file)
+			if err != nil {
+				t.Fatalf("mode=%q file=%q: %v", mode, file, err)
+			}
+			if got != Degraded {
+				t.Errorf("mode=%q file=%q: want Degraded fallback, got len=%d", mode, file, len(got))
+			}
+		}
 	}
-	if got != defaultPrompt {
-		t.Errorf("Load() returned non-default prompt (len=%d vs %d)", len(got), len(defaultPrompt))
-	}
-	if len(got) == 0 {
-		t.Error("default prompt is empty")
+	// 兜底文本必须是极短中性句：不能因为将来误改又变成长人设。
+	if len(Degraded) > 512 {
+		t.Errorf("Degraded should stay short and neutral, got %d bytes", len(Degraded))
 	}
 }
 

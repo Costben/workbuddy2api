@@ -4,6 +4,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"strconv"
@@ -26,7 +27,7 @@ type Config struct {
 	// 面板会给账号绑一条线路（auths/*.json 顶层 `proxy` 写的是**线路名**），这个名字
 	// 在这里解析成地址；线路名查不到时上游**明确报错、不静默直连**（静默直连等于
 	// 「以为隔离了其实没隔离」，见 upstream.TransportFor）。
-	Proxies map[string]string `json:"proxies"`
+	Proxies ProxyTable `json:"proxies"`
 
 	// ReasoningAsContent 思考通道兜底（issue #135）：国际版 deepseek 思考模式下
 	// 答案只出现在 reasoning_content、content 恒空，只看 content 的客户端会看到
@@ -83,18 +84,23 @@ type Config struct {
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
 		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
-		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
+		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于 ua_style）。
 		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
 		// issue #42 深挖：官网「使用端」列基于出站请求 UA 的服务端归因，官方 WorkBuddy
-		// 桌面 UA 为 `WorkBuddy/<version>`。默认值已对齐官方（A 段变更），用户仍可配完全
+		// 桌面 UA 为单段 `WorkBuddy/<version>`。默认值已对齐官方桌面端，用户仍可配完全
 		// 自定义值改写。
 		UserAgent string `json:"user_agent"`
+		// UAStyle 默认 UA 形态："desktop"（缺省）= 官方桌面端单段式
+		// `WorkBuddy/<ver>`（global 为 `WorkBuddy AI/<ver>`）；"cli" = 官方 CLI
+		// 三段式 `WorkBuddy/<ver> <platform>/<ver> CLI/<cliVer>`（issue #497）。
+		// 仅影响默认 UA；显式 user_agent 仍最高优先，billing/checkin 恒单段。
+		UAStyle string `json:"ua_style"`
 		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与白名单
-		// 头组 X-IDE-Version 的取值）。空 = 内置默认（对齐官方 5.5.4 分发包）；
+		// 头组 X-IDE-Version 的取值）。空 = 内置默认（对齐官方 5.11.3 分发包）；
 		// 显式配置（如升级后的桌面包版本）则随配置走。
 		ClientVersion string `json:"client_version"`
 		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（对齐官方内置 CLI
-		// 2.137.1）；显式配置则随配置走。
+		// 2.63.2）；仅在 ua_style=cli 时使用，显式配置则随配置走。
 		CliVersion string `json:"cli_version"`
 
 		// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底。
@@ -139,8 +145,8 @@ type Config struct {
 		// custom = 网关用自有系统提示词替换客户端 system/developer（显式配置仍可覆盖回替换）；
 		// append = 两者并用：开头连续 system/developer 块后插网关 system，既有消息逐字不动（issue #129）。
 		Mode string `json:"mode"` // "custom" / "append" / "passthrough"
-		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
-		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
+		// File 提示词文件路径；空 = 中性兜底 prompt.Degraded（issue #498 起不再内置人设）；
+		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到兜底文本）。
 		File string `json:"file"`
 	} `json:"prompt"`
 
@@ -240,10 +246,12 @@ func Default() *Config {
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
-	// 出站指纹默认伪造官方 WorkBuddy 桌面端：UA 三段式 + X-IDE-* 头组
+	// 出站指纹默认伪造官方 WorkBuddy 桌面端：UA 单段式 + X-IDE-* 头组
 	// （upstream.Client 的 attributionClientName 空值也回落 WorkBuddy，双保险）；
 	// 显式 client_name="SaaS" 还原旧行为。
 	c.Upstream.ClientName = "WorkBuddy"
+	// UA 形态默认 desktop（官方桌面端单段式）；显式 "cli" 才回退三段式。
+	c.Upstream.UAStyle = "desktop"
 	// 大请求体压缩默认开：省的是本机出口带宽（issue #297 实测 1Mbps 出口下 3MB 差 20s+）。
 	c.Upstream.GzipBody = true
 	c.Features.SanitizeBlacklistFingerprints = true
@@ -342,6 +350,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_USER_AGENT"); v != "" {
 		c.Upstream.UserAgent = v
+	}
+	if v := os.Getenv("WB2A_UA_STYLE"); v != "" {
+		c.Upstream.UAStyle = v
 	}
 	if v := os.Getenv("WB2A_DEVICE_TOKEN"); v != "" {
 		c.Upstream.DeviceToken = v
@@ -568,6 +579,17 @@ func (c *Config) normalize() error {
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
 	}
+	// UA 形态（issue #497）：缺省/desktop = 官方桌面端单段式；cli = 旧三段式。
+	// 与 prompt.mode 同样采用 fail-fast：拼错的值不静默回落，避免用户以为切到了
+	// CLI 形态却仍发桌面 UA。
+	switch style := strings.ToLower(strings.TrimSpace(c.Upstream.UAStyle)); style {
+	case "", "desktop":
+		c.Upstream.UAStyle = "desktop"
+	case "cli":
+		c.Upstream.UAStyle = "cli"
+	default:
+		return fmt.Errorf("upstream.ua_style: %q 不是合法值（desktop / cli）", c.Upstream.UAStyle)
+	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
 	}
@@ -589,8 +611,8 @@ func (c *Config) normalize() error {
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。
 //
 // mode 非法（非 custom/append/passthrough）启动报错，避免静默回落到某一分支；
-// custom/append 模式下 file 非空但不可读 → 报错（fail fast），file 空 → 用内置默认
-// （两模式共用同一加载路径，PromptText 均非空）。
+// custom/append 模式下 file 非空但不可读 → 报错（fail fast）；file 空 → 回落到
+// prompt.Degraded 中性兜底（issue #498：不再有随二进制分发的人设文本）。
 // passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
 func (c *Config) normalizePrompt() error {
 	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
@@ -607,6 +629,10 @@ func (c *Config) normalizePrompt() error {
 		text, err := prompt.Load(c.Prompt.Mode, c.Prompt.File)
 		if err != nil {
 			return err
+		}
+		if strings.TrimSpace(c.Prompt.File) == "" {
+			// 不静默：issue #498 的抱怨之一就是「回落到内置文本却没有任何日志」。
+			log.Printf("[WARN] prompt.mode=%s 但 prompt.file 为空，使用中性兜底提示词（不再内置人设）", c.Prompt.Mode)
 		}
 		c.PromptText = text
 	}

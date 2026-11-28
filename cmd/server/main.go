@@ -164,13 +164,21 @@ func main() {
 		stopSanitizeWatch := make(chan struct{})
 		defer close(stopSanitizeWatch)
 		go watchSanitizeConfig(*cfgPath, stopSanitizeWatch)
+		// 出口线路表同样随 config.json 热重载（issue #379）：面板加/改线路后
+		// 不必重启上游，聊天请求立刻按新线路出站。
+		stopProxyWatch := make(chan struct{})
+		defer close(stopProxyWatch)
+		go watchProxyConfig(*cfgPath, stopProxyWatch)
 	}
 	if n := len(cfg.Features.SanitizeExtraFeatures); n > 0 {
 		log.Printf("净化额外特征词表已加载：%d 条（config.json features.sanitize_extra_features）", n)
 	}
-	// 出站 UA（A 段）：非空才做显式覆盖，空 = 默认 WorkBuddy 三段式
-	// `WorkBuddy/<client_version> WorkBuddy/<client_version> CLI/<cli_version>`。
+	// 出站 UA：非空才做显式覆盖（最高优先）；空 = 按 ua_style 走默认形态。
+	// desktop（缺省）= 官方桌面端单段式 `WorkBuddy/<client_version>`（global 为
+	// `WorkBuddy AI/<client_version>`）；cli = 三段式
+	// `WorkBuddy/<ver> <platform>/<ver> CLI/<cli_version>`。
 	up.UserAgent = cfg.Upstream.UserAgent
+	up.UAStyle = cfg.Upstream.UAStyle
 	// 版本段（upstream.client_version / cli_version）：空 = 各走内置默认。
 	up.ClientVersion = cfg.Upstream.ClientVersion
 	up.CliVersion = cfg.Upstream.CliVersion

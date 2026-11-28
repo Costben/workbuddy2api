@@ -61,6 +61,15 @@ type Auth struct {
 	// 那会让低权重的号一直闲置，积分用不完就过期（正是 #187 另一半诉求要避免的）。
 	// 硬门槛（冷却 / 熔断 / 禁用 / 在途占满）与成本分层不受本字段影响。
 	Weight float64
+
+	// SkipTasks 账号级「只转发、不跑定时任务」开关（issue #437），来源 auth 文件
+	// 顶层 `skip_tasks`。true 时账号仍在池里、照常参与选号转发，但 scheduler 的
+	// 签到 / 保活 / 旅行 / 活跃 / 开学季 / 夜猫子等任务逐号跳过它。
+	//
+	// 为什么需要：企业账号没有个人成长体系，签到端点恒返回 400 code=10001；
+	// 面板的「临时停用」会把账号摘出池子、连转发也停掉，不满足「只是别跑任务」。
+	// 本字段只在 Parse 时写入、之后不变（热加载整体替换 *Auth），读侧无需加锁。
+	SkipTasks bool
 }
 
 // 手写权重的取值区间：低于 MinWeight 等于「几乎不用」（但仍留一丝机会，与
@@ -305,6 +314,8 @@ func Parse(raw []byte) (*Auth, error) {
 			Proxy string `json:"proxy"`
 			// Weight 顶层 weight（手写权重，面板写入；见 Auth.Weight）。
 			Weight float64 `json:"weight"`
+			// SkipTasks 顶层 skip_tasks（不参与定时任务，面板写入；见 Auth.SkipTasks）。
+			SkipTasks bool `json:"skip_tasks"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -321,6 +332,7 @@ func Parse(raw []byte) (*Auth, error) {
 			DeviceToken:  n.DeviceToken,
 			ProxyName:    strings.TrimSpace(n.Proxy),
 			Weight:       sanitizeWeight(n.Weight),
+			SkipTasks:    n.SkipTasks,
 		}
 	} else {
 		var f struct {
@@ -339,6 +351,8 @@ func Parse(raw []byte) (*Auth, error) {
 			// 单独成组（上方空行）是为了不改动既有字段的对齐 —— 补丁切片只描述
 			// 自己的增量，gofmt 顺手重排别人的行会让前一个补丁的「已应用」判定失效。
 			Weight float64 `json:"weight"`
+			// SkipTasks 顶层 skip_tasks（不参与定时任务，面板写入；见 Auth.SkipTasks）。
+			SkipTasks bool `json:"skip_tasks"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -355,6 +369,7 @@ func Parse(raw []byte) (*Auth, error) {
 			DeviceToken:  f.DeviceToken,
 			ProxyName:    strings.TrimSpace(f.Proxy),
 			Weight:       sanitizeWeight(f.Weight),
+			SkipTasks:    f.SkipTasks,
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -405,6 +420,12 @@ func (a *Auth) SaveAtomic() error {
 	// 手改过的文件也不会因此多出 weight: 1 这种噪音）。
 	if a.Weight != 0 {
 		doc["weight"] = a.Weight
+	}
+	// SkipTasks 只在 true 时写回：false / 缺省不落键，老文件不会被加上噪音键。
+	// 刷新 token 会整份重建文件，不保留就等于把「不参与定时任务」静默清掉
+	// （企业账号随即又开始在签到上白打 400/10001）。
+	if a.SkipTasks {
+		doc["skip_tasks"] = true
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

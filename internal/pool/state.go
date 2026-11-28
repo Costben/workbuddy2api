@@ -155,8 +155,8 @@ func (p *Pool) NoteError(uid string) {
 	}
 }
 
-// ModelCost 读取账号在某模型上的实测扣费观测（CostPer1k 与是否存在有效观测）。
-// DeptestOnly: 生产只写不读（NoteModelCost 有调用），读取侧仅
+// ModelCost 读取账号在某模型上的每千 token 单价诊断值（CostPer1k）与是否存在
+// 有效观测。DeptestOnly: 生产只写不读（NoteModelCost 有调用），读取侧仅
 // handler_cost_test / global_e2e_test 断言账本内容（账本内容现经 state.json
 // 持久化，但 /status 透出走 statusOf 的只读遍历，不经本方法）。跨包
 // （internal/server）测试引用，迁 export_test.go 不可行（对包外不可见）。
@@ -172,29 +172,32 @@ func (p *Pool) ModelCost(uid, model string) (per1k float64, ok bool) {
 	if !ok {
 		return 0, false
 	}
-	return mc.CostPer1k, true
+	return mc.per1k(), true
 }
 
-// NoteModelCost 记录一次实测扣费观测，更新该 (账号, 模型) 的成本账本，并顺带
+// NoteModelCost 记录一次实测扣费观测，累加该 (账号, 模型) 的成本账本，并顺带
 // 扣减账号余额（credits/creditsExpiring，见下方「P1-A」段）。credit 为上游
 // usage.credit（本次真实扣费=消耗量），tokens 为本次请求的 token 总数
-// （prompt+completion，用于折算单位成本）。tokens<=0 时不记录：无法折算单价，
-// 记进去会污染账本。
+// （prompt+completion）。tokens<=0 时不记录：无法折算。
 //
-// 用 EMA 平滑（alpha=0.3，约 5 次观测收敛）：单次异常值不主导选号决策。
+// issue #491 起改用累计量（TotalCredit/TotalRequests/TotalTokens），不再 EMA：
+//   - 选号口径是 per-req（每次请求平均扣费）：credit 主要是固定底价，几乎不随
+//     token 增长；per1k 实际度量「账号平均接到多长的请求」，跨账号可差 1300 倍。
+//   - tokens < modelCostMinTokens 的请求**不更新账本**（只扣余额）：短探测的
+//     per-token 折算没有统计意义，且旧 EMA 会让一次探测污染账本很久。
+//   - 累计量保留全部有效观测，后续修正不会被历史 EMA 权重放大。
+//
 // 账本持久化到 state.json（stateAccount.ModelCosts，P1-anti-monopoly）：重启后
 // 成本知识保留，限免/夜间免费的跨重启窗口不再重新付学费探测；落盘/恢复均按
 // modelCostTTL 惰性过滤——陈旧价格（时段性优惠）不跨 TTL 复活。
-// 限免结束事件：tier 0 观测（per1k≤0）被 credit>0 观测覆盖时打一条明确日志
+// 限免结束事件：此前已累计确认为免费（tier 0）且本次 credit>0 时打一条明确日志
 // （运维据此知道"免费午餐结束了"），判定在写入口做、只看覆盖前值。
 func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	if uid == "" || model == "" || tokens <= 0 {
 		return
 	}
-	// 单价按每千 token 归一，消除请求长度差异。
-	per1k := credit / float64(tokens) * 1000
-	if per1k < 0 {
-		per1k = 0
+	if credit < 0 {
+		credit = 0 // 防御：上游异常负扣费按 0 处理，不污染累计量
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -209,6 +212,8 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	// 高权重直到打空撞 402；global 账号不签到，credits 曾是终身冻结。
 	// 签到仍定期覆盖（ReenableIfCredits/SetCreditsDetailed 以 authoritative 余额
 	// 重置），扣减只是两次签到之间的内插估计；credit=0（免费请求）不动余额。
+	//
+	// 余额扣减与成本观测门槛无关：短请求也是真实消费，必须扣余额；只是不记账。
 	if credit > 0 {
 		d := int64(credit + 0.5) // 四舍五入，与测试口径一致（2.5 → 3）
 		if d > e.credits {
@@ -222,27 +227,37 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 			e.creditsExpiring -= d
 		}
 	}
+	if tokens < modelCostMinTokens {
+		// 观测门槛（issue #491）：短请求只扣余额，不更新成本账本（不创建条目、
+		// 不刷新 LastSeen），否则 max_tokens=5 探测会污染排序。
+		if credit > 0 {
+			p.dirty.Store(true)
+		}
+		return
+	}
 	if e.modelCost == nil {
 		e.modelCost = make(map[string]modelCostEntry)
 	}
-	const alpha = 0.3
 	prev, seen := e.modelCost[model]
-	if !seen {
-		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
-	} else {
-		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
-		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束，
-		// EMA 混合后单价转正，下一轮选号即降 tier 2。打一条日志让运维看得见
-		// 「免费午餐结束」这一关键状态迁移。
-		if prev.CostPer1k <= 0 && per1k > 0 {
-			log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
-		}
-		e.modelCost[model] = modelCostEntry{
-			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
-			LastSeen:  time.Now(),
-			Samples:   prev.Samples + 1,
-		}
+	now := time.Now()
+	mc := modelCostEntry{
+		LastSeen:      now,
+		Samples:       prev.Samples + 1,
+		TotalCredit:   prev.TotalCredit + credit,
+		TotalRequests: prev.TotalRequests + 1,
+		TotalTokens:   prev.TotalTokens + int64(tokens),
 	}
+	// 诊断值由累计量现算；迁移条目（TotalRequests==0）在首笔新观测后即被新
+	// 累计量取代，旧 EMA 不再参与任何决策。
+	mc.CostPer1k = mc.per1k()
+	// 限免结束事件（判定在写入口，只看覆盖前值）：此前已累计确认免费（两笔以上
+	// credit=0）且本次实测收费——账号在该模型上的免费窗口结束，下一轮选号即降
+	// tier 2。打一条日志让运维看得见「免费午餐结束」这一关键状态迁移。
+	if seen && prev.knownFree() && credit > 0 {
+		log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k (%.3f credits/req)",
+			model, logfmt.UID8(uid), mc.per1k(), mc.costPerReq())
+	}
+	e.modelCost[model] = mc
 	p.dirty.Store(true) // 账本已持久化（P1-anti-monopoly）：写入口统一置脏
 }
 
@@ -605,7 +620,7 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 }
 
 // modelCostsStatusLocked 构建单账号的成本台账行，从 modelCost 遍历输出——
-// 每模型一行（单价/最近观测/样本数），仅 modelCostTTL 内的有效观测，过期即
+// 每模型一行（per-req 权威值 + 诊断 per1k/最近观测/样本数），仅 modelCostTTL 内的有效观测，过期即
 // 消失（与 modelCostOf 读取口径一致；与 rateLimitedModelsLocked 同构）。
 // 先排序模型名保证 /status 输出稳定（map 遍历无序）。无观测 → nil（零回归）。
 // 调用方必须已持有 p.mu。
@@ -628,10 +643,11 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
 	for _, m := range models {
 		mc := e.modelCost[m]
 		rows = append(rows, ModelCostStatus{
-			Model:     m,
-			CostPer1k: mc.CostPer1k,
-			LastSeen:  mc.LastSeen,
-			Samples:   mc.Samples,
+			Model:      m,
+			CostPerReq: mc.costPerReq(),
+			CostPer1k:  mc.per1k(),
+			LastSeen:   mc.LastSeen,
+			Samples:    mc.Samples,
 		})
 	}
 	return rows

@@ -19,7 +19,9 @@ func TestStatusCostExploreExposed(t *testing.T) {
 		&auth.Auth{UID: "unknown"},
 	)
 	p.SetCostExploreInterval(time.Hour)
-	p.NoteModelCost("free", "m", 0, 1000)
+	// issue #491：单笔 credit=0 不再判免费，需两笔足量观测才进 tier 0。
+	p.NoteModelCost("free", "m", 0, 2000)
+	p.NoteModelCost("free", "m", 0, 2000)
 	h := NewHandler(Config{Pool: p})
 
 	// 触发一次探索（tier 0 垄断 + tier 1 存在 + 零值 timer）。

@@ -55,5 +55,12 @@
   "0054-http2-transport.patch": "900a01e5d662d995dd09393c35f83342596434fbb57722d8ae430b957df853a1",
   "0055-queue-waiting.patch": "336cbb7798a3e9f9f5a11cd6ccf50548d6437e9b1f739f5c17b2d131c2a267a7",
   "0056-model-cooldown-reset-at-retention.patch": "252c9ed14f8732aebc55b053b63b9d98e23e602b309b681e36cb8b010024675f",
-  "0057-web-search-tool.patch": "cadb0b28c30ec53efae4f921cba4a4dfa9255ce9a141b9a038560cfccde45044"
+  "0057-web-search-tool.patch": "cadb0b28c30ec53efae4f921cba4a4dfa9255ce9a141b9a038560cfccde45044",
+  "0058-keepalive-near-expiry.patch": "5460dcdf050469888ab0e9dee1ca02bb1c1e3aabf7159b22bedd7a22061f8a00",
+  "0059-model-cost-per-request.patch": "885e93dbff9c8fbd45345e0787b79b151d848a7485befb0950e8b9957789f825",
+  "0060-account-skip-tasks.patch": "2f0aecfb582077fc7271453a7b5f2d1af19269c5d9d1fed8ae342ab879414bc2",
+  "0061-task-runner-new-codes.patch": "d495d244870d38677f9ef16352a834c6be387fdacce761090949dfa3e734173d",
+  "0062-proxy-config-hot-reload.patch": "64c09f0df6d758998c7c801b9360810f48ea52ebfae5ca2046ed351fc5993cfc",
+  "0063-ua-desktop-alignment.patch": "13053a9b40d42640d07fd1ce5488c12c7fb014e167ee4628a02cbbc2f277f478",
+  "0064-prompt-neutral-fallback.patch": "2346e7f1035fd8bf8f2d44a4585ab278bf588e6a5c15e4ac5022eca38da0b2f1"
 }

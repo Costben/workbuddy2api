@@ -18,7 +18,7 @@ const sseWithCredit = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\"
 
 // sseFree 末帧 credit=0（限免模型）。
 const sseFree = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"hy3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n" +
-	"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"hy3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":500,\"credit\":0}}\n\n" +
+	"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"hy3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":1000,\"credit\":0}}\n\n" +
 	"data: [DONE]\n\n"
 
 // sseUsageNoCredit 末帧带 usage 但**无 credit 字段**（R9(c) 分支：global SSE 末帧形态）。
@@ -204,8 +204,8 @@ func TestRotationPreservesFullContext(t *testing.T) {
 
 // TestStatusModelCostsLedger end-to-end（P1-anti-monopoly 可观测性）：成功请求
 // 记入成本账本后，GET /status 的 accounts[].model_costs 透出台账——每模型一行
-//（model/cost_per_1k/last_seen/samples），免费观测 per1k=0、收费观测 per1k>0，
-// 无观测账号该字段为空。
+// （model/cost_per_req + 诊断 cost_per_1k/last_seen/samples）。issue #491：
+// cost_per_req 是选号权威口径，cost_per_1k 只作诊断。
 func TestStatusModelCostsLedger(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz == "Bearer at-u2" {
@@ -253,13 +253,16 @@ func TestStatusModelCostsLedger(t *testing.T) {
 			t.Errorf("u%s last_seen 未透出", st.UID)
 		}
 		switch st.UID {
-		case "u1": // 收费：2.0 credit / 2000 token → per1k = 1.0
+		case "u1": // 收费：每笔 2.0 credit → per-req=2.0，per1k=1.0（2.0/2000×1000）
+			if row.CostPerReq != 2.0 {
+				t.Errorf("u1 cost_per_req=%v want 2.0（选号权威口径）", row.CostPerReq)
+			}
 			if row.CostPer1k != 1.0 {
-				t.Errorf("u1 cost_per_1k=%v want 1.0", row.CostPer1k)
+				t.Errorf("u1 cost_per_1k=%v want 1.0（诊断值）", row.CostPer1k)
 			}
 		case "u2": // 免费（显式 credit:0）
-			if row.CostPer1k != 0 {
-				t.Errorf("u2 cost_per_1k=%v want 0", row.CostPer1k)
+			if row.CostPerReq != 0 || row.CostPer1k != 0 {
+				t.Errorf("u2 cost_per_req=%v cost_per_1k=%v want 0/0", row.CostPerReq, row.CostPer1k)
 			}
 		}
 	}

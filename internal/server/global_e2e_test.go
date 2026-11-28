@@ -230,14 +230,31 @@ func TestGlobalE2ER9CreditIsomorphic(t *testing.T) {
 		t.Logf("R9 末帧 usage.credit 存在（与 CN 同构 ✓）")
 	}
 
-	// NoteModelCost 被调用：账本应记录该 (uid, model) 观测，且为 tier0 免费（credit=0）。
+	// NoteModelCost 接线 + issue #491 观测门槛。本测试的 max_tokens=10 通常远低于
+	// 2000 token 门槛：此时账本**必须为空**（短探测不污染排序）；只有长请求才
+	// 断言观测存在且为 credit=0 的合法免费观测（单笔 0 仍属 tier 1 未知，不判免费，
+	// 免费层需要两笔累计 0——单元测试已覆盖）。
+	totalTokens := 0
+	for _, k := range []string{"prompt_tokens", "completion_tokens"} {
+		if v, ok := usage[k].(float64); ok {
+			totalTokens += int(v)
+		}
+	}
 	per1k, ok := p.ModelCost(a.UID, "deepseek-v4.1-flash")
+	if totalTokens < 2000 {
+		if ok {
+			t.Errorf("R9 短请求 tokens=%d (<2000) 不应写账本: per1k=%v", totalTokens, per1k)
+		} else {
+			t.Logf("R9 短请求 tokens=%d (<2000)：按 #491 门槛不写账本 ✓", totalTokens)
+		}
+		return
+	}
 	if !ok {
 		t.Errorf("R9 NoteModelCost 未被调用：pool.ModelCost(%s, deepseek-v4.1-flash) 无观测", logfmt.UID8(a.UID))
 	} else if per1k != 0 {
-		t.Errorf("R9 账本 per1k=%.6f want 0（deepseek-v4.1-flash 应为 tier0 免费层）", per1k)
+		t.Errorf("R9 账本 per1k=%.6f want 0（credit=0 免费观测）", per1k)
 	} else {
-		t.Logf("R9 NoteModelCost 已被调用：tier0 免费层（credit=0 → per1k=0）✓")
+		t.Logf("R9 NoteModelCost 已被调用：credit=0 → per1k=0（单笔 0 仍为 tier1 未知）✓")
 	}
 }
 

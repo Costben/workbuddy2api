@@ -217,22 +217,29 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			}
 		}
 		// 恢复 modelCosts（P1-anti-monopoly）：按 modelCostTTL 惰性过滤（超 6h 的
-		// 按过期处理，回 tier 1 不复活陈旧知识）+ 非法值剔除（负 per1k / 零
-		// LastSeen 的结构破损条目不污染账本；state.json 手工脏数据防御）。
+		// 按过期处理，回 tier 1 不复活陈旧知识）+ 非法值剔除（负 per1k/累计量 /
+		// 零 LastSeen 的结构破损条目不污染账本；state.json 手工脏数据防御）。
+		// 老 state.json 只有 cost_per_1k（TotalRequests==0）：累计量保持 0，读取侧
+		// costPerReq/costTier 按迁移语义沿用旧值，绝不把 CostPerReq 置 0（否则
+		// 升级后全池瞬间挤进 tier 0）。
 		// 损坏更重的形态（整个文件非法 JSON）已在 load() 静默跳过，不崩溃。
 		if len(s.ModelCosts) > 0 {
 			e.modelCost = make(map[string]modelCostEntry, len(s.ModelCosts))
 			for m, smc := range s.ModelCosts {
-				if smc.LastSeen.IsZero() || smc.CostPer1k < 0 {
+				if smc.LastSeen.IsZero() || smc.CostPer1k < 0 ||
+					smc.TotalCredit < 0 || smc.TotalRequests < 0 || smc.TotalTokens < 0 {
 					continue // 结构破损/非法值：剔除条目
 				}
 				if now.Sub(smc.LastSeen) > modelCostTTL {
 					continue // 过期：陈旧价格不复活（同落盘侧口径）
 				}
 				e.modelCost[m] = modelCostEntry{
-					CostPer1k: smc.CostPer1k,
-					LastSeen:  smc.LastSeen,
-					Samples:   smc.Samples,
+					CostPer1k:     smc.CostPer1k,
+					LastSeen:      smc.LastSeen,
+					Samples:       smc.Samples,
+					TotalCredit:   smc.TotalCredit,
+					TotalRequests: smc.TotalRequests,
+					TotalTokens:   smc.TotalTokens,
 				}
 			}
 			if len(e.modelCost) == 0 {
@@ -381,9 +388,12 @@ func (p *Pool) stateOverviewLocked() stateFile {
 					continue // 已过期/零值：不落盘（惰性清理）
 				}
 				mcosts[m] = stateModelCost{
-					CostPer1k: mc.CostPer1k,
-					LastSeen:  mc.LastSeen,
-					Samples:   mc.Samples,
+					CostPer1k:     mc.per1k(),
+					LastSeen:      mc.LastSeen,
+					Samples:       mc.Samples,
+					TotalCredit:   mc.TotalCredit,
+					TotalRequests: mc.TotalRequests,
+					TotalTokens:   mc.TotalTokens,
 				}
 			}
 			if len(mcosts) == 0 {

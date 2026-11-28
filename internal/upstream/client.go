@@ -848,14 +848,23 @@ type Client struct {
 	channelBlockedMu sync.Mutex
 	channelBlocked   map[string]time.Time
 
-	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认 WorkBuddy
-	// 三段式与 billingUA 单段式）。空 = 默认官方形态：chat/refresh/FetchModels 走
-	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing/checkin 走 `WorkBuddy/<ver>`
-	// （仅当 client_name 非空，见 billingUA）。
+	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于 ua_style 形态
+	// 与 billingUA 单段式）。空 = 默认官方形态：chat/refresh/FetchModels 走
+	// `WorkBuddy/<ver>`（global 为 `WorkBuddy AI/<ver>`）；billing/checkin 走
+	// `WorkBuddy/<ver>`（仅当 client_name 非空，见 billingUA）。
 	// issue #42 深挖：官网「使用端」列基于出站请求的 UA/X-Product 服务端归因，
-	// 官方 WorkBuddy 桌面 UA 见 defaultWorkBuddyUAFor。默认值已对齐官方（A 段变更），
-	// 用户仍可显式配置完全自定义的 UA。
+	// 官方 WorkBuddy 桌面 UA 见 defaultWorkBuddyUAFor。用户仍可显式配置完全
+	// 自定义的 UA。
 	UserAgent string
+
+	// UAStyle 默认 UA 形态（config upstream.ua_style）：
+	//   - 空 / "desktop"（默认）：官方桌面端单段式 `WorkBuddy/<ver>`，
+	//     global 为 `WorkBuddy AI/<ver>`（issue #497）；
+	//   - "cli"：旧版官方 CLI 三段式
+	//     `WorkBuddy/<ver> <platform>/<ver> CLI/<cliVer>`。
+	// 仅影响 chat/refresh/FetchModels 的默认 UA；billing/checkin 恒为单段。
+	// 显式 UserAgent 仍最高优先。
+	UAStyle string
 
 	// DeviceToken 设备风控 Token（X-Device-Token 头）兜底来源：config upstream.device_token。
 	// 仅当 auth.Auth.DeviceToken 为空时才取此值；两者皆空则不注入该头。
@@ -875,12 +884,13 @@ type Client struct {
 	ClientName string
 
 	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + B 段的
-	// X-IDE-Version）。空 = 内置默认 defaultClientVersion（对齐官方 5.5.4 分发包）。
+	// X-IDE-Version）。空 = 内置默认 defaultClientVersion（对齐官方 5.11.3 分发包）。
 	// config upstream.client_version 覆盖。
 	ClientVersion string
 
 	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认 defaultCliVersion
-	// （对齐官方内置 CLI 2.137.1）。config upstream.cli_version 覆盖。
+	// （对齐官方内置 CLI 2.63.2）。仅在 ua_style=cli 时使用；config
+	// upstream.cli_version 覆盖。
 	CliVersion string
 
 	// PassthroughIP 是否透传客户端 IP 给上游（X-Forwarded-For/X-Real-IP 首段）。
@@ -1367,6 +1377,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if cerr != nil {
 		// 线路配置错误：立刻失败、**不进轮转**（换多少个号都一样），也不喂熔断 ——
 		// 这是配置问题，不是账号问题（见 clientFor 的注释）。
+		logRouteConfigError(a, cerr)
 		return nil, 0, nil, cerr
 	}
 	paths := c.chatPaths(a)
@@ -1735,9 +1746,10 @@ func (m dynModelEntry) modelInfo() ModelInfo {
 // global 走 /v2/enterprises/personal/models（PR #20 实测 /console 500、/v2 200 含
 // credits 倍率的完整模型表）。modelsPath 按 globalOn 分发。
 // v3ConfigPath 是 CN/global 双域通用的 /v3/config 模型目录端点（v3 系客户端权威
-// 目录；UA 门禁：仅三段式 CLI UA 可过，CommonHeaders 即满足，见
+// 目录；历史上三段式 CLI UA 实测可过其 UA 门禁，见
 // .claude/reports/global-models-missing.md）：v3 为主、企业端点补缺（任务书
-// v3-config-merge）。
+// v3-config-merge）。issue #497 起默认 UA 改为桌面单段式；若现场该门禁返回
+// 400 code 12403，可配 upstream.ua_style=cli 回退三段式。
 const (
 	cnModelsPath     = "/console/enterprises/personal/models"
 	globalModelsPath = "/v2/enterprises/personal/models"
@@ -1953,8 +1965,9 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	// CommonHeaders 三段式 CLI UA 实测可通过 /v3/config 的 UA 门禁
-	// （Bearer + web UA → 400 code 12403，见 global-models-missing.md）。
+	// CommonHeaders 当前默认桌面单段式 UA；历史上三段式 CLI UA 已实测可通过
+	// /v3/config 的 UA 门禁（Bearer + web UA → 400 code 12403，见
+	// global-models-missing.md）。若桌面形态被拒，可用 upstream.ua_style=cli 回退。
 	c.CommonHeaders(req, a)
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)

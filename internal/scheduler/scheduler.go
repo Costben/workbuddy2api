@@ -611,6 +611,14 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 			out = append(out, oc)
 			continue
 		}
+		// 账号级「不参与任务」（issue #437）：企业账号没有个人成长体系，签到恒
+		// 400/10001；它在池里照常转发，但任何定时任务都不该再打它。
+		if a.SkipTasks {
+			oc.Status, oc.Detail = CheckinSkipped, "skip_tasks"
+			skipN++
+			out = append(out, oc)
+			continue
+		}
 		// D4 门控：realm=global 账号无签到体系/任务中心，直接跳过（不发起任何上游调用，避免风控）。
 		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
 		// 按 CN 处理——这是 D5 逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
@@ -755,6 +763,9 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
+		}
+		if a.SkipTasks {
+			continue // 账号级「只转发、不跑任务」（issue #437）
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
 		// 点亮连登）；realmBase 路由/头由 upstream.billingJSON/BillingHeaders 按 realm 切。
@@ -1089,6 +1100,10 @@ func (s *Scheduler) runKeepalive(ctx context.Context) {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
 			skipped++
+			continue
+		}
+		if a.SkipTasks {
+			skipped++ // 账号级「不参与任务」：保活也不跑（issue #437）
 			continue
 		}
 		// 按需刷新：临近到期 / 到期未知且久未刷 / 久未轮换（见 keepaliveRefreshDue）。
